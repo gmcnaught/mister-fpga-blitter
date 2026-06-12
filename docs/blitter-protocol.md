@@ -97,13 +97,14 @@ CV1000-style).
 | 1   | src_off (byte offset into source heap) [31:0]            |||
 | 2   | src_x [31:16]              | src_stride (bytes) [15:0]   ||
 | 3   | h [31:16]                 | w [15:0] *(blit size, px)*  ||
-| 4   | src_y [31:16]             | (reserved) [15:0]           ||
+| 4   | (reserved) [31:16]        | src_y [15:0]                ||
 | 5   | dst_y (s16) [31:16]       | dst_x (s16) [15:0]          ||
 | 6   | priority [31:24] | alpha [23:16] | colorkey (RGB565) [15:0]|||
-| 7   | color (RGB565 fill) [15:0] | (reserved: tint/zoom)      ||
+| 7   | (reserved: tint/zoom) [31:16] | color (RGB565 fill) [15:0]||
 
-*(The exact u32 packing above is the wire layout; the struct in the header is
-the field-accurate host view. #003 freezes the bit positions in RTL + a packer.)*
+Qwords pack as `qw[k] = {u32[2k+1], u32[2k]}` (little-endian). This layout is
+**frozen** — implemented identically in `rtl/blitter_top.sv` (unpack) and
+`sim/gen_vectors.c` (pack), and verified bit-exact end-to-end (§7).
 
 **opcode:** `0 NOP · 1 END · 2 FILL · 3 BLIT`
 **blend_mode (BLIT):** `0 COPY (opaque) · 1 COLORKEY (skip src==colorkey) · 2 CONST_ALPHA`
@@ -156,3 +157,12 @@ alpha=0/255 endpoints), HFLIP, VFLIP, negative/edge/offscreen clipping, the END
 terminator, and painter-order overdraw. This model is (a) the golden output the
 #003 RTL is diffed against, and (b) the executable spec the host emitter (#006)
 develops against without hardware.
+
+**RTL ↔ model equivalence (`../sim/`):** `rtl/blitter_top.sv` is simulated
+(Icarus Verilog) against a behavioral DDR model; `sim/gen_vectors.c` drives the
+*same* reference model to produce a golden framebuffer, and the testbench diffs
+the blitter's DDR output qword-for-qword. `cd sim && make test` → **11/11
+scenarios PASS** (FILL, COPY, COLORKEY, CONST_ALPHA, H/V flip, negative +
+offscreen clip, painter-order overdraw, hardware CLEAR, buffer-1 target). This
+makes the protocol above an *executable, dual-verified* contract — not just a
+paper spec — before any Quartus build or hardware run.

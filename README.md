@@ -16,8 +16,9 @@ DDR; the fabric executes them and composites the framebuffer.
 | Feasibility / architecture (go/no-go) | ✅ **GO** — `docs/blitter-feasibility.md` |
 | Command protocol + DDR ring + handshake | ✅ spec — `docs/blitter-protocol.md` |
 | Software reference model + tests | ✅ `refmodel/` — `make test` = 28/28 pass |
-| Minimal blitter RTL spike (one rect-copy, HW proof) | ⏳ next (`rtl/`) |
-| Compositing feature set (alpha/colorkey/rects) | ⏳ |
+| Blitter RTL (functional) ↔ model equivalence in sim | ✅ `rtl/` + `sim/` — `make test` = 11/11 pass |
+| RTL spike on hardware (CI build + DDR-frame-counter / screenshot proof) | ⏳ needs MiSTer online |
+| Perf architecture: on-chip buffer + burst-DMA (line/tile) | ⏳ #004/#005 |
 | Host command emitter + engine backend | ⏳ (lives in the engine repos) |
 
 ## Architecture (fixed)
