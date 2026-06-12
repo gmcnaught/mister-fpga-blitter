@@ -1,5 +1,8 @@
-# Reference model build artifacts
+# Build artifacts (host tools + test binaries + generated vectors)
 refmodel/test_blitter_ref
+host/test_emitter
+sim/gen_vectors
+*.hex
 *.o
 *.bak
 

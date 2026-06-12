@@ -13,6 +13,7 @@
  *  GPL-3.0.
  */
 #include "blitter_ref.h"
+#include "blt_wire.h"   /* canonical command packing (shared with host emitter) */
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -67,21 +68,6 @@ static void add_blit(int16_t x,int16_t y,uint16_t w,uint16_t h,uint16_t stride,
     c->w=w; c->h=h; c->dst_x=x; c->dst_y=y; c->colorkey=key; c->alpha=alpha;
 }
 static void add_end(void){ nc()->opcode = BLT_OP_END; }
-
-/* ---- command -> 4 qwords (matches blitter_top unpack) ------------------ */
-static void pack_cmd(const blt_cmd_t*c, uint64_t qw[4]){
-    uint32_t u[8] = {0};
-    u[0] = (uint32_t)c->opcode | ((uint32_t)c->blend_mode<<8) |
-           ((uint32_t)c->format<<16) | ((uint32_t)c->flags<<24);
-    u[1] = c->src_off;
-    u[2] = (uint32_t)c->src_stride | ((uint32_t)c->src_x<<16);
-    u[3] = (uint32_t)c->w | ((uint32_t)c->h<<16);
-    u[4] = (uint32_t)c->src_y;
-    u[5] = (uint32_t)(uint16_t)c->dst_x | ((uint32_t)(uint16_t)c->dst_y<<16);
-    u[6] = (uint32_t)c->colorkey | ((uint32_t)c->alpha<<16) | ((uint32_t)0<<24);
-    u[7] = (uint32_t)c->color;
-    for (int k=0;k<4;k++) qw[k] = (uint64_t)u[2*k] | ((uint64_t)u[2*k+1]<<32);
-}
 
 static void fill_fb_region(uint32_t base, uint16_t color){
     uint64_t w4 = (uint64_t)color | ((uint64_t)color<<16) |
@@ -139,9 +125,9 @@ int main(int argc,char**argv){
     mem[BLTCTRL_QW+C_FLAGS]    = scn_flags;
     mem[BLTCTRL_QW+C_DONE]     = 0;
     mem[BLTCTRL_QW+C_STATUS]   = 0;
-    /* ring */
-    for(int i=0;i<ncmds;i++){ uint64_t qw[4]; pack_cmd(&cmds[i],qw);
-        for(int k=0;k<4;k++) mem[RING_QW + (uint32_t)i*4 + k] = qw[k]; }
+    /* ring (canonical packing; 32 LE bytes == 4 qwords on this host) */
+    for(int i=0;i<ncmds;i++){ uint8_t w[BLT_CMD_BYTES]; blt_pack_cmd(&cmds[i], w);
+        memcpy((uint8_t*)&mem[RING_QW + (uint32_t)i*4], w, BLT_CMD_BYTES); }
     /* source heap (byte view; host is little-endian) */
     memcpy((uint8_t*)&mem[SRC_QW], heap, heap_len);
 

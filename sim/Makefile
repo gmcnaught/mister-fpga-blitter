@@ -24,8 +24,8 @@ test: gen_vectors blitter_tb.vvp
 blitter_tb.vvp: tb_blitter.sv ddr_model.sv ../rtl/blitter_top.sv ../rtl/blitter_defs.vh
 	$(IVERILOG) -g2012 -I../rtl -o $@ tb_blitter.sv ddr_model.sv ../rtl/blitter_top.sv
 
-gen_vectors: gen_vectors.c ../refmodel/blitter_ref.c ../refmodel/blitter_ref.h
-	$(CC) -O2 -Wall -I../refmodel -o $@ gen_vectors.c ../refmodel/blitter_ref.c
+gen_vectors: gen_vectors.c ../refmodel/blitter_ref.c ../refmodel/blitter_ref.h ../host/blt_wire.h
+	$(CC) -O2 -Wall -I../refmodel -I../host -o $@ gen_vectors.c ../refmodel/blitter_ref.c
 
 clean:
 	rm -f gen_vectors blitter_tb.vvp ddr_init.hex fb_expected.hex
