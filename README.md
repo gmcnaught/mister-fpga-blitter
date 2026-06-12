@@ -99,7 +99,7 @@ compositing from DDR traffic.
 > by the public design and module boundaries of the CAVE / CV1000 core. **No RTL
 > is copied** from Arcade-Cave_MiSTer. It serves as prior-art guidance only. Both
 > projects are GPL-3.0, consistent with the MiSTer ecosystem. Full survey:
-> `docs/blitter-feasibility.md` and the epic's `research-mister-blitters.md`.
+> `docs/blitter-feasibility.md` and `research-docs/research-mister-blitters.md`.
 
 ## How to build / run the reference model
 
@@ -120,11 +120,12 @@ against.
 ## Layout
 
 ```
-docs/      design docs: feasibility (go/no-go) + protocol spec (the contract)
-refmodel/  C reference model — golden output for the RTL, executable spec for host
-rtl/       SystemVerilog blitter core
-sim/       testbench + DDR model: RTL ↔ reference-model equivalence vectors
-host/      host-side command emitter (display-list builder for the engine backend)
+docs/          design docs: feasibility (go/no-go) + protocol spec (the contract)
+research-docs/  prior-art survey of existing MiSTer 2D-acceleration cores
+refmodel/      C reference model — golden output for the RTL, exec spec for host
+rtl/           SystemVerilog blitter core
+sim/           testbench + DDR model: RTL ↔ reference-model equivalence vectors
+host/          host-side command emitter (display-list builder for engine backend)
 ```
 
 ## Status

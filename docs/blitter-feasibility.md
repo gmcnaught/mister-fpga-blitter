@@ -43,7 +43,7 @@ Worst case ~768K source pixels/frame (5× overdraw). A 64-bit datapath processes
 Even a scalar 1 px/clock path is ~7.7 ms — under the 16.7 ms frame and far under
 the 19 ms A9 cost it replaces. Compositing is comfortably sub-frame.
 
-## 4. Prior-art survey (summary; full doc: epic `research-mister-blitters.md`)
+## 4. Prior-art survey (summary; full doc: `../research-docs/research-mister-blitters.md`)
 
 The **MiSTer Cave / CV1000 core** is the gold-standard analog: an SH-3 CPU emits
 blit commands to a Cyclone FPGA that composites sprites into a DDR framebuffer —

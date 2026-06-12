@@ -18,8 +18,8 @@
  *
  *  Design lineage: command-list-walked-until-END (Saturn VDP1), per-command
  *  rect blit with colorkey skip-write fast path + optional const-alpha blend
- *  (CV1000). See ../docs/blitter-protocol.md and the epic research doc
- *  research-mister-blitters.md.
+ *  (CV1000). See ../docs/blitter-protocol.md and
+ *  ../research-docs/research-mister-blitters.md.
  *
  *  Copyright (C) 2026 — GPL-3.0 (matches solarus-mister/fpga).
  */
