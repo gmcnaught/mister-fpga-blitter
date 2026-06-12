@@ -1,0 +1,29 @@
+# Reference model build artifacts
+refmodel/test_blitter_ref
+*.o
+*.bak
+
+# Simulation artifacts (iverilog/verilator, vcd waveforms)
+*.vvp
+*.vcd
+*.fst
+obj_dir/
+
+# Quartus build output (RTL synthesis)
+db/
+incremental_db/
+output_files/
+qdb/
+*.qws
+*.rpt
+*.summary
+*.smsg
+*.pin
+*.sof
+*.pof
+*.jdi
+*.done
+
+# OS junk
+.DS_Store
+._*
