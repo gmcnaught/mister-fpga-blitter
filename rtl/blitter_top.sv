@@ -60,6 +60,7 @@ module blitter_top #(
     localparam [7:0] F_HFLIP=8'h01, F_VFLIP=8'h02, F_COLORKEY=8'h04;
 
     reg  [5:0]  state, rd_ret, wr_ret;
+    reg         rd_issued;   // read accepted by the bus, now awaiting dout_ready
     reg  [63:0] rd_data;
 
     reg  [31:0] submit_reg, done_reg, cmd_count, cmd_idx, frame_counter;
@@ -126,7 +127,7 @@ module blitter_top #(
         if (rst) begin
             state<=S_POLL_SUBMIT; mem_rd<=0; mem_wr<=0; mem_be<=0;
             mem_addr<=0; mem_din<=0; idle<=1; frame_counter<=0;
-            cmd_idx<=0; fetch_k<=0; submit_reg<=0; done_reg<=0;
+            cmd_idx<=0; fetch_k<=0; submit_reg<=0; done_reg<=0; rd_issued<=0;
         end else begin
             mem_rd<=1'b0;
             case (state)
@@ -273,8 +274,22 @@ module blitter_top #(
                 mem_din<=64'd0; wr_ret<=S_POLL_SUBMIT; state<=S_WR_WAIT;
             end
 
-            S_RD_WAIT: if (mem_dout_ready) begin rd_data<=mem_dout; state<=rd_ret; end
-            S_WR_WAIT: begin mem_wr<=1'b0; mem_be<=8'h00; state<=wr_ret; end
+            // Backpressure-safe generic read: hold mem_rd until the bus accepts
+            // it (~mem_busy), then await dout_ready. (mem_busy = ddram busy OR not
+            // granted by the arbiter; on the never-busy sim model this is a no-op.)
+            S_RD_WAIT: begin
+                if (!rd_issued) begin
+                    mem_rd <= 1'b1;                       // hold request
+                    if (!mem_busy) rd_issued <= 1'b1;     // accepted this cycle
+                end else if (mem_dout_ready) begin
+                    rd_data <= mem_dout; rd_issued <= 1'b0; state <= rd_ret;
+                end
+            end
+            // Backpressure-safe generic write: mem_wr/addr/din/be held from the
+            // issue state; clear + advance only once the bus accepts (~mem_busy).
+            S_WR_WAIT: if (!mem_busy) begin
+                mem_wr <= 1'b0; mem_be <= 8'h00; state <= wr_ret;
+            end
             default: state<=S_POLL_SUBMIT;
             endcase
         end
