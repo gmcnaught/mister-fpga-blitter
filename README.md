@@ -70,9 +70,16 @@ Two architectural decisions define the core:
    single f2h DDR port via a small arbiter (video scanout keeps priority) and
    composites the *inactive* buffer during the inter-frame window, then page-flips
    on vBlank. The proven control-word handshake and scanout reader are untouched.
-2. **Composite on-chip, burst-DMA to DDR.** The blitter never writes DDR per
-   pixel; it composites into an on-chip line/tile buffer and bursts it out as
-   long 64-bit sequential transfers. DDR never sees random per-texel traffic.
+2. **Composite on-chip, burst-DMA to DDR** *(target architecture)*. The blitter
+   composites into an on-chip line/tile buffer and bursts it out as long 64-bit
+   sequential transfers, so DDR never sees random per-texel traffic. The
+   **shipping/HW-validated** core (below) is the simpler single-transaction
+   variant — it composites through the shared arbiter directly; the on-chip
+   line-buffer + burst-DMA build is implemented and sim-validated on the
+   `burst-dma` branch of the `solarus-mister` integration repo, but does **not
+   yet meet timing** at the ~100 MHz f2h clock (best worst-case setup slack
+   −0.385 ns, from −4.979), and is parked pending a profile of whether on-chip
+   composite or DDR bandwidth is the real bottleneck.
 
 ## Prior art & acknowledgements
 
@@ -112,10 +119,22 @@ cd refmodel && make test     # builds + runs unit tests (28/28 pass)
 
 `refmodel/blitter_ref.h` is the machine-readable copy of the command contract in
 `docs/blitter-protocol.md`. `refmodel/blitter_ref.c` defines the exact per-pixel
-semantics (FILL / COPY / COLORKEY / CONST_ALPHA / flips / clipping /
-walk-until-END) that the RTL must reproduce bit-for-bit. It is both the **golden
-output** the RTL is diffed against and the spec host command emitters develop
-against.
+semantics (FILL / COPY / COLORKEY / CONST_ALPHA / per-pixel alpha (PALPHA,
+ARGB4444 source) / flips / clipping / walk-until-END) that the RTL must reproduce
+bit-for-bit. It is both the **golden output** the RTL is diffed against and the
+spec host command emitters develop against.
+
+## Hardware validation (Solarus on MiSTer)
+
+The blitter is **validated end-to-end on real hardware** (DE10-Nano) driving the
+Solarus 1.6.5 engine port. The A9 emits the per-frame display list; the fabric
+composites and the unchanged scanout displays it. Live captures show correct
+video (title + animated scenes) with the engine diagnostics reporting full
+offload — `escape=0`, every frame composited on the fabric — at **~100 fps** on
+heavy scenes (vs ~30 fps for the A9 software renderer), using the 4 MiB source
+heap so full scene transitions stay resident. This is the single-transaction
+core (decision 2 above); the engine backend lives in the `solarus-mister` repo
+and vendors `host/` + `refmodel/blitter_ref.h` from here verbatim.
 
 ## Layout
 
@@ -136,9 +155,10 @@ host/          host-side command emitter (display-list builder for engine backen
 | Command protocol + DDR ring + handshake | ✅ spec — `docs/blitter-protocol.md` |
 | Software reference model + tests | ✅ `refmodel/` — `make test` = 28/28 pass |
 | Blitter RTL ↔ model equivalence in sim | ✅ `rtl/` + `sim/` — `make test` = 11/11 pass |
-| RTL spike on hardware (DDR-frame-counter / screenshot proof) | ⏳ needs MiSTer online |
-| Perf architecture: on-chip buffer + burst-DMA (line/tile) | ⏳ #004/#005 |
-| Host command emitter + engine backend | ⏳ `host/` + engine repos |
+| Host command emitter + wire codec | ✅ `host/` — `make test` = 22/22 pass |
+| **On hardware (correct video + offload, Solarus/MiSTer)** | ✅ **validated** — ~100 fps heavy-scene offload, `escape=0`, 4 MiB heap |
+| Host command emitter + engine backend | ✅ Solarus backend (COPY/COLORKEY/CONST_ALPHA/PALPHA/flips), HW-verified |
+| Perf architecture: on-chip buffer + burst-DMA (line/tile) | ⏳ `solarus-mister:burst-dma` — sim-validated, timing not yet met (−0.385 ns); parked |
 
 ## License
 
