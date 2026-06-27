@@ -1,3 +1,4 @@
+/* VENDORED from github.com/gmcnaught/mister-fpga-blitter (refmodel/blitter_ref.h) — do not edit here; edit upstream + re-copy. */
 /*
  *  blitter_ref.h — Software reference model for the MiSTer fabric 2D blitter.
  *
@@ -18,8 +19,8 @@
  *
  *  Design lineage: command-list-walked-until-END (Saturn VDP1), per-command
  *  rect blit with colorkey skip-write fast path + optional const-alpha blend
- *  (CV1000). See ../docs/blitter-protocol.md and
- *  ../research-docs/research-mister-blitters.md.
+ *  (CV1000). See ../docs/blitter-protocol.md and the epic research doc
+ *  research-mister-blitters.md.
  *
  *  Copyright (C) 2026 — GPL-3.0 (matches solarus-mister/fpga).
  */
@@ -44,6 +45,25 @@ enum {
     BLT_OP_END   = 1,  /* terminate the command list (walk-until-END)        */
     BLT_OP_FILL  = 2,  /* solid-fill dst rect with cmd.color (RGB565)        */
     BLT_OP_BLIT  = 3,  /* copy/composite src rect -> dst per blend_mode      */
+    BLT_OP_STAGE = 4,  /* copy source surface DDR3->SDRAM for fast reads.    *
+                         * Field mapping (other fields unused / zero):        *
+                         *   src_off          = byte offset in DDR heap (off) *
+                         *   w  (low 16 bits) = size[15:0]                   *
+                         *   h  (high 16 bits)= size[31:16]                  *
+                         * Reconstruct: size = (uint32_t)w | ((uint32_t)h<<16)*
+                         * Wire: u32[1]=src_off, u32[3]=w|h<<16              *
+                         * The actual DDR->SDRAM copy FSM is issued by the   *
+                         * fabric when it walks this command (future task).   */
+    BLT_OP_TILELIST = 5, /* batch of N tiles from one shared texture+blend.       *
+                          * Header (blt_cmd_t) carries shared params; the N        *
+                          * per-tile rects live in a VRAM entry array.             *
+                          * Field mapping (header):                                *
+                          *   src_off/src_stride = shared tileset texture base     *
+                          *   src_x/src_y        = tileset texture w/h (bounds)    *
+                          *   blend_mode/format/flags/alpha/colorkey = shared      *
+                          *   w | h<<16          = entry count N (u32)             *
+                          *   dst_x | dst_y<<16  = entry-array byte offset         *
+                          * Each entry is a blt_tile_entry_t (12 bytes).           */
 };
 
 /* ---- Blend modes (cmd.blend_mode), for BLT_OP_BLIT ---------------------- */
@@ -51,12 +71,19 @@ enum {
     BLT_BLEND_COPY        = 0, /* opaque copy (fast path)                     */
     BLT_BLEND_COLORKEY    = 1, /* skip src pixels == cmd.colorkey (fast path) */
     BLT_BLEND_CONST_ALPHA = 2, /* dst = src*a + dst*(1-a), a=cmd.alpha/255    */
+    /* COLORKEY + CONST_ALPHA combined: set flags BLT_F_COLORKEY on a
+     * CONST_ALPHA blit to also skip keyed pixels. */
     BLT_BLEND_PALPHA      = 3, /* per-pixel source-over: src is ARGB4444,
                                 * dst = src*a + dst*(1-a), a = src.A4 (per px).
                                 * Source MUST be BLT_FMT_ARGB4444; A4==0 pixels
                                 * are skip-write (leave dst). (v2)             */
-    /* COLORKEY + CONST_ALPHA combined: set flags BLT_F_COLORKEY on a
-     * CONST_ALPHA blit to also skip keyed pixels. */
+    /* [v2 escape-elim] color-mod (BLT_F_COLORMOD) is applied to the source
+     * BEFORE these blends, so it composes with all of them. ADD/MULTIPLY also
+     * apply to BLT_OP_FILL (src channel = cmd.color channel). */
+    BLT_BLEND_ADD         = 4, /* per-channel saturating add: out = min(src+dst, chan_max)
+                                * at RGB565 widths (R/B max 31, G max 63).      */
+    BLT_BLEND_MULTIPLY    = 5, /* per-channel modulate: out = round(src*dst / chan_max).
+                                * Golden defines the exact (divide-free) reduction. */
 };
 
 /* ---- Source pixel formats (cmd.format) ---------------------------------- */
@@ -70,6 +97,20 @@ enum {
 #define BLT_F_HFLIP     0x01u  /* mirror source horizontally                  */
 #define BLT_F_VFLIP     0x02u  /* mirror source vertically                    */
 #define BLT_F_COLORKEY  0x04u  /* honor colorkey even in a CONST_ALPHA blit   */
+#define BLT_F_STAGE_DST 0x08u  /* [#32] STAGE: u32[2] ({src_x,src_stride}) carries the SDRAM dest offset */
+#define BLT_F_SRC_SDRAM 0x10u  /* [#34] BLIT: read THIS source from SDRAM (per-command mux). C_SRCSEL is a
+                                * frame-level master ENABLE; this per-command flag selects DDR3 vs SDRAM
+                                * for each blit, so a frame may mix staged (SDRAM) + un-staged (DDR3) sources. */
+#define BLT_F_SRC_FB    0x20u  /* BLIT: source is a framebuffer written by the compositor (ch0/P_DST), read
+                                * here via ch5/P_SRC — the per-frame carry-forward FB->FB copy. The fabric
+                                * fires the dst-barrier (commit ch0 + invalidate ch5) before this BLIT's
+                                * source fetch so the two double-buffers stay coherent (no frame divergence). */
+#define BLT_F_COLORMOD  0x40u  /* [v2 escape-elim] color-mod (tint) present: _pad[0..2] = {cr,cg,cb} (u8).
+                                * The source pixel is modulated per-channel BEFORE the blend:
+                                * src_ch' = round(src_ch * mod_ch / 255) at the dest channel width
+                                * (divide-free /255, same reduction as blt_blend565). CLEAR => no mod
+                                * (true no-op; v1 zero-pad stays correct). Host sets it only when
+                                * (cr,cg,cb) != (255,255,255). Orthogonal to blend_mode (composes). */
 
 /*
  *  Blit command — 32 bytes / 8x uint32. Layout is the on-wire DDR ring entry;
@@ -98,8 +139,19 @@ typedef struct {
     uint16_t colorkey;     /* RGB565 transparent key (COLORKEY modes)         */
     uint16_t color;        /* RGB565 fill color (FILL)                        */
     uint8_t  alpha;        /* 0..255 constant alpha (CONST_ALPHA)             */
-    uint8_t  _pad[3];      /* reserved -> 32 bytes; future tint/zoom          */
+    uint8_t  _pad[3];      /* [v2] color-mod when BLT_F_COLORMOD: _pad[0]=cr,  *
+                            * _pad[1]=cg, _pad[2]=cb (RGB888 modulation). Else *
+                            * reserved (zero). Keeps the command at 32 bytes.  */
 } blt_cmd_t;
+
+/*
+ *  BLT_OP_TILELIST per-tile entry (12 bytes, on-wire little-endian).
+ */
+typedef struct {
+    uint16_t src_x, src_y;   /* tile sub-rect origin in the tileset   */
+    uint16_t w, h;           /* tile size (pixels)                    */
+    int16_t  dst_x, dst_y;   /* signed dst origin (offscreen-cullable)*/
+} blt_tile_entry_t;
 
 /*
  *  Source surface heap. In hardware this is a DDR region the blitter's read
@@ -133,6 +185,18 @@ uint16_t blt_rgb565(uint8_t r, uint8_t g, uint8_t b);
 uint16_t blt_blend565(uint16_t src, uint16_t dst, uint8_t alpha);
 /* Canonical channel blend: (s*a + d*(255-a) + 127)/255. Divide-free RTL form
  * (bit-exact, verified): (t + 128 + ((t+128)>>8)) >> 8, t = s*a + d*(255-a). */
+
+/* [v2 escape-elim] C-reference goldens (bodies in blitter_ref.c — Workstream C).
+ * Each MUST be bit-exact to its comp_pipeline RTL stage (gated in tb_*). */
+/* color-mod: modulate src565 per channel by RGB888 (cr,cg,cb). Per dest-width
+ * channel: out_ch = round(src_ch * mod_ch / 255), divide-free /255 reduction
+ * matching blt_blend565. (255,255,255) is an exact identity. */
+uint16_t blt_tint565(uint16_t src565, uint8_t cr, uint8_t cg, uint8_t cb);
+/* saturating add: out_ch = min(src_ch + dst_ch, chan_max) (R/B max 31, G max 63). */
+uint16_t blt_add565(uint16_t src565, uint16_t dst565);
+/* multiply: out_ch = round(src_ch * dst_ch / chan_max). C owns the exact
+ * divide-free reduction; RTL must match it bit-for-bit. */
+uint16_t blt_mul565(uint16_t src565, uint16_t dst565);
 
 /* Per-pixel source-over: src16 is ARGB4444 {A4,R4,G4,B4}, dst16 is RGB565.
  * Expand A4->A8 (a8={a4,a4}) and src R4/G4/B4 to the dest channel widths
