@@ -30,3 +30,5 @@ qdb/
 # OS junk
 .DS_Store
 ._*
+refmodel/selftest_ref
+host/selftest_emitter

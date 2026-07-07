@@ -29,7 +29,7 @@ static uint16_t *run_ring(const uint8_t *ring, int ncmds, const uint8_t *heap,
     for (int i=0;i<BLT_FB_PIXELS;i++) fb[i]=clear;
     blt_cmd_t *cmds = malloc((size_t)ncmds * sizeof(blt_cmd_t));
     for (int i=0;i<ncmds;i++) blt_unpack_cmd(ring + (size_t)i*BLT_CMD_BYTES, &cmds[i]);
-    blt_surface_heap_t h = { heap, heap_len };
+    blt_surface_heap_t h = { heap, heap_len, NULL, NULL };
     blt_execute(fb, &h, cmds, ncmds);
     free(cmds);
     return fb;
@@ -104,7 +104,7 @@ static void test_emitter_vs_handbuilt(void)
 
     uint16_t *fbB = malloc(BLT_FB_PIXELS*sizeof(uint16_t));
     for (int i=0;i<BLT_FB_PIXELS;i++) fbB[i]=CLEAR;
-    blt_surface_heap_t hp = { heap, e.heap_used };
+    blt_surface_heap_t hp = { heap, e.heap_used, NULL, NULL };
     blt_execute(fbB, &hp, h, 6);
 
     CHECK(memcmp(fbA, fbB, BLT_FB_PIXELS*sizeof(uint16_t))==0,
