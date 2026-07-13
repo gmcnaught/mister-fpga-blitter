@@ -69,6 +69,23 @@ static void add_blit(int16_t x,int16_t y,uint16_t w,uint16_t h,uint16_t stride,
 }
 static void add_end(void){ nc()->opcode = BLT_OP_END; }
 
+/* [MFGPU] TRILIST: heap = [1x1 RGB565 tex @0][ntris*3 verts @16]; header points
+ * at the vertex entry buffer (dst_x|dst_y<<16 = entry_off, w = triangle count). */
+static void add_trilist(uint16_t texpix, uint8_t blend, uint8_t hdr_alpha,
+                        const blt_vtx_t *v, int ntris){
+    const uint32_t eoff = 16;
+    size_t vbytes = (size_t)ntris*3*sizeof(blt_vtx_t);
+    memset(heap, 0, eoff + vbytes);
+    heap[0]=texpix&0xFF; heap[1]=texpix>>8;
+    memcpy(heap+eoff, v, vbytes);
+    heap_len = eoff + vbytes;
+    blt_cmd_t*c=nc(); c->opcode=BLT_OP_TRILIST; c->blend_mode=blend;
+    c->format=BLT_FMT_RGB565; c->src_off=0; c->src_stride=2; c->src_x=1; c->src_y=1;
+    c->w=(uint16_t)ntris; c->dst_x=(int16_t)(eoff&0xFFFF); c->dst_y=(int16_t)(eoff>>16);
+    c->alpha=hdr_alpha;
+}
+#define TV(px,py,cr,cg,cb,ca) { (int16_t)((px)<<4),(int16_t)((py)<<4),0,0, BLT_RGBA(cr,cg,cb,ca),0 }
+
 static void fill_fb_region(uint32_t base, uint16_t color){
     uint64_t w4 = (uint64_t)color | ((uint64_t)color<<16) |
                   ((uint64_t)color<<32) | ((uint64_t)color<<48);
@@ -103,6 +120,16 @@ static int build(const char*s){
         add_fill(0,0,2,2,0x00BB); add_end(); }
     else if(!strcmp(s,"target1")){ scn_target=1; scn_clear=img_fb_init=0x0007;
         heap_solid(4,4,0x07E0); add_blit(8,8,4,4,8,BLT_BLEND_COPY,0,0,0); add_end(); }
+    else if(!strcmp(s,"tri_copy")){ scn_clear=img_fb_init=0x0000;
+        static const blt_vtx_t v[6]={
+            TV(5,5,255,0,0,255),  TV(15,5,255,0,0,255),  TV(15,15,255,0,0,255),
+            TV(5,5,255,0,0,255),  TV(15,15,255,0,0,255), TV(5,15,255,0,0,255) };
+        add_trilist(0xFFFF, BLT_BLEND_COPY, 255, v, 2); add_end(); }
+    else if(!strcmp(s,"tri_alpha")){ scn_clear=img_fb_init=0x001F; /* blue bg */
+        static const blt_vtx_t v[6]={
+            TV(0,0,255,0,0,128),  TV(20,0,255,0,0,128),  TV(20,20,255,0,0,128),
+            TV(0,0,255,0,0,128),  TV(20,20,255,0,0,128), TV(0,20,255,0,0,128) };
+        add_trilist(0xFFFF, BLT_BLEND_CONST_ALPHA, 255, v, 2); add_end(); }
     else { fprintf(stderr,"unknown scenario '%s'\n",s); return -1; }
     return 0;
 }
