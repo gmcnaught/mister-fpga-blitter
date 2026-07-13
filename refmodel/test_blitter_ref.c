@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 
 static int g_fail = 0;
 static int g_checks = 0;
@@ -217,9 +218,18 @@ static void test_end_and_overdraw(void)
     free(fb); free(fb2);
 }
 
+static void test_trilist_layout(void){
+    assert(sizeof(blt_vtx_t) == 16);
+    assert(BLT_OP_TRILIST == 8);
+    blt_vtx_t v = { .x=1, .y=2, .u=3, .v=4, .rgba=BLT_RGBA(10,20,30,40), ._rsvd=0 };
+    assert((v.rgba & 0xff)==10 && ((v.rgba>>24)&0xff)==40);
+    printf("test_trilist_layout OK\n");
+}
+
 int main(void)
 {
     printf("=== blitter reference model unit tests ===\n");
+    test_trilist_layout();
     test_fill();
     test_copy();
     test_colorkey();

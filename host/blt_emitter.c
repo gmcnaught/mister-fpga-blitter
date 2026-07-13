@@ -71,6 +71,7 @@ void blt_begin_frame(blt_emitter_t *e, int target_buf, int clear,
 {
     e->cmd_count   = 0;
     e->tl_used     = 0;        /* reset tile-list entry buffer cursor */
+    e->vtx_used    = 0;        /* reset TRILIST vertex buffer cursor */
     e->overflow    = 0;        /* fresh per-frame overflow flag */
     /* target_buf: 0/1 = the two display framebuffers; 2 = the OFF-SCREEN bg-cache
      * compose region (issue #18). Must NOT collapse 2 -> 1: the old `?1:0` clamped
@@ -346,6 +347,52 @@ int blt_frt_upload(blt_emitter_t *e, uint32_t qword_count)
     c.opcode = BLT_OP_FRT_UPLOAD;
     c.w = (uint16_t)(qword_count & 0xFFFF);        /* count low  16 */
     c.h = (uint16_t)(qword_count >> 16);           /* count high 16 */
+    return emit(e, &c);
+}
+
+/* ── [MFGPU] BLT_OP_TRILIST ──────────────────────────────────────────────────
+ *  blt_push_tris stages blt_vtx_t triples into the per-frame vertex buffer;
+ *  blt_trilist emits a header-only command pointing at that entry offset. The
+ *  vertex buffer is a slice of the source DDR the fabric reads (the refmodel
+ *  resolves the entries from heap->base + entry_off), so entry_off is a byte
+ *  offset within that source region. */
+void blt_vtx_buf_init(blt_emitter_t *e, void *vtx_buf, size_t vtx_cap)
+{
+    e->vtx_buf  = (uint8_t *)vtx_buf;
+    e->vtx_cap  = vtx_cap;
+    e->vtx_used = 0;
+}
+
+uint32_t blt_push_tris(blt_emitter_t *e, const blt_vtx_t *tris, int ntris)
+{
+    if (ntris <= 0) { e->overflow = 1; return 0xFFFFFFFFu; }
+    size_t nbytes = (size_t)ntris * 3u * sizeof(blt_vtx_t);
+    if (!e->vtx_buf || e->vtx_used + nbytes > e->vtx_cap) {
+        e->overflow = 1; return 0xFFFFFFFFu;
+    }
+    uint32_t off = (uint32_t)e->vtx_used;
+    memcpy(e->vtx_buf + e->vtx_used, tris, nbytes);
+    e->vtx_used += nbytes;
+    return off;
+}
+
+int blt_trilist(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
+                uint16_t colorkey, uint8_t alpha, uint32_t entry_off, int ntris)
+{
+    if (!tex.valid || ntris <= 0) { e->overflow = 1; return -1; }
+    blt_cmd_t c; memset(&c, 0, sizeof c);
+    c.opcode     = BLT_OP_TRILIST;
+    c.blend_mode = blend;
+    c.format     = tex.format;
+    c.src_off    = tex.off;               /* texture page base (source-heap byte off) */
+    c.src_stride = tex.stride;            /* texture row stride (bytes)               */
+    c.src_x      = tex.w;                 /* texture width  (texels)                  */
+    c.src_y      = tex.h;                 /* texture height (texels)                  */
+    c.w          = (uint16_t)ntris;       /* triangle count                           */
+    c.dst_x      = (int16_t)(entry_off & 0xFFFF);       /* entry_off low  16          */
+    c.dst_y      = (int16_t)(entry_off >> 16);          /* entry_off high 16          */
+    c.colorkey   = colorkey;
+    c.alpha      = alpha;
     return emit(e, &c);
 }
 

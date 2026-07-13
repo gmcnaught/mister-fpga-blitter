@@ -162,6 +162,48 @@ static void test_overflow_guard(void)
     free(ring);
 }
 
+/* ----- BLT_OP_TRILIST: push vertices + emit header, render via blt_execute --- */
+static void test_emit_trilist_roundtrip(void)
+{
+    printf("test_emit_trilist_roundtrip\n");
+    uint8_t *ring = malloc(RING_CAP);
+    uint8_t dummy_heap[64];
+    /* One source-DDR image holds BOTH the vertex entries (blt_push_tris, from
+     * offset 0) and the texture (staged at a high offset). blt_execute reads
+     * both from this single heap base. */
+    static uint8_t srcdram[4096];
+    memset(srcdram, 0, sizeof srcdram);
+    const uint32_t TEX_OFF = 2048;
+    srcdram[TEX_OFF] = 0xff; srcdram[TEX_OFF+1] = 0xff;   /* 1x1 white RGB565 */
+
+    blt_emitter_t e;
+    blt_emitter_init(&e, ring, RING_CAP, dummy_heap, sizeof dummy_heap);
+    blt_vtx_buf_init(&e, srcdram, sizeof srcdram);
+    blt_begin_frame(&e, 0, 0, 0);
+
+    /* two-triangle red quad at (5,5)-(15,15); white texel modulated by red vtx color */
+#define VV(px,py,cr,cg,cb,ca) (blt_vtx_t){ (int16_t)((px)<<4),(int16_t)((py)<<4),0,0, BLT_RGBA(cr,cg,cb,ca),0 }
+    blt_vtx_t tris[6] = {
+        VV(5,5,255,0,0,255),  VV(15,5,255,0,0,255),  VV(15,15,255,0,0,255),
+        VV(5,5,255,0,0,255),  VV(15,15,255,0,0,255), VV(5,15,255,0,0,255),
+    };
+#undef VV
+    uint32_t eoff = blt_push_tris(&e, tris, 2);
+    CHECK(eoff == 0, "first push lands at offset 0");
+
+    blt_surface_ref_t tex = { .off=TEX_OFF, .stride=2, .w=1, .h=1,
+                              .format=BLT_FMT_RGB565, .valid=1,
+                              .sdram_off=BLT_ALLOC_FAIL };
+    CHECK(blt_trilist(&e, tex, BLT_BLEND_COPY, 0, 255, eoff, 2) == 0, "blt_trilist emit ok");
+    CHECK(!e.overflow, "no overflow");
+
+    uint16_t *fb = run_ring(ring, e.cmd_count, srcdram, sizeof srcdram, 0x0000);
+    CHECK(fb[10*BLT_FB_WIDTH+10]==0xF800, "interior red via emitted TRILIST");
+    CHECK(fb[10*BLT_FB_WIDTH+15]==0x0000, "right edge exclusive (top-left rule)");
+    free(fb);
+    free(ring);
+}
+
 int main(void)
 {
     printf("=== emitter + wire codec tests ===\n");
@@ -169,6 +211,7 @@ int main(void)
     test_emitter_vs_handbuilt();
     test_heap_persistence();
     test_overflow_guard();
+    test_emit_trilist_roundtrip();
     printf("=== %d checks, %d failures ===\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

@@ -69,6 +69,41 @@ static void add_blit(int16_t x,int16_t y,uint16_t w,uint16_t h,uint16_t stride,
 }
 static void add_end(void){ nc()->opcode = BLT_OP_END; }
 
+/* [MFGPU] TRILIST: heap = [1x1 RGB565 tex @0][ntris*3 verts @16]; header points
+ * at the vertex entry buffer (dst_x|dst_y<<16 = entry_off, w = triangle count). */
+static void add_trilist(uint16_t texpix, uint8_t blend, uint8_t hdr_alpha,
+                        const blt_vtx_t *v, int ntris){
+    const uint32_t eoff = 16;
+    size_t vbytes = (size_t)ntris*3*sizeof(blt_vtx_t);
+    memset(heap, 0, eoff + vbytes);
+    heap[0]=texpix&0xFF; heap[1]=texpix>>8;
+    memcpy(heap+eoff, v, vbytes);
+    heap_len = eoff + vbytes;
+    blt_cmd_t*c=nc(); c->opcode=BLT_OP_TRILIST; c->blend_mode=blend;
+    c->format=BLT_FMT_RGB565; c->src_off=0; c->src_stride=2; c->src_x=1; c->src_y=1;
+    c->w=(uint16_t)ntris; c->dst_x=(int16_t)(eoff&0xFFFF); c->dst_y=(int16_t)(eoff>>16);
+    c->alpha=hdr_alpha;
+}
+#define TV(px,py,cr,cg,cb,ca) { (int16_t)((px)*16),(int16_t)((py)*16),0,0, BLT_RGBA(cr,cg,cb,ca),0 }
+#define TVU(px,py,u,v,cr,cg,cb,ca) { (int16_t)((px)*16),(int16_t)((py)*16),(uint16_t)(u),(uint16_t)(v), BLT_RGBA(cr,cg,cb,ca),0 }
+
+/* Composable heap builder for multi-draw / non-1x1-texture TRILIST scenarios. */
+static uint32_t heap_cur;
+static void     h_start(void){ memset(heap,0,4096); heap_cur=0; heap_len=0; }
+static uint32_t h_bump(uint32_t n){ uint32_t o=heap_cur; heap_cur+=n; if(heap_cur>heap_len) heap_len=heap_cur; return o; }
+static uint32_t h_tex1(uint16_t px){ uint32_t o=h_bump(16); heap[o]=px&0xFF; heap[o+1]=px>>8; return o; }
+static uint32_t h_tex_checker4(void){ uint32_t o=h_bump(32);
+    for(int y=0;y<4;y++) for(int x=0;x<4;x++){ uint16_t c=((x+y)&1)?0x07E0:0xF800;
+        heap[o+(y*4+x)*2]=c&0xFF; heap[o+(y*4+x)*2+1]=c>>8; } return o; }
+static uint32_t h_verts(const blt_vtx_t*v,int ntris){ size_t nb=(size_t)ntris*3*sizeof(blt_vtx_t);
+    uint32_t o=h_bump((uint32_t)nb); memcpy(heap+o,v,nb); return o; }
+static void add_tri(uint8_t blend,uint8_t alpha,uint32_t texoff,uint16_t tw,uint16_t th,
+                    uint16_t stride,uint32_t eoff,int ntris){
+    blt_cmd_t*c=nc(); c->opcode=BLT_OP_TRILIST; c->blend_mode=blend; c->format=BLT_FMT_RGB565;
+    c->src_off=texoff; c->src_stride=stride; c->src_x=tw; c->src_y=th; c->w=(uint16_t)ntris;
+    c->dst_x=(int16_t)(eoff&0xFFFF); c->dst_y=(int16_t)(eoff>>16); c->alpha=alpha;
+}
+
 static void fill_fb_region(uint32_t base, uint16_t color){
     uint64_t w4 = (uint64_t)color | ((uint64_t)color<<16) |
                   ((uint64_t)color<<32) | ((uint64_t)color<<48);
@@ -103,6 +138,49 @@ static int build(const char*s){
         add_fill(0,0,2,2,0x00BB); add_end(); }
     else if(!strcmp(s,"target1")){ scn_target=1; scn_clear=img_fb_init=0x0007;
         heap_solid(4,4,0x07E0); add_blit(8,8,4,4,8,BLT_BLEND_COPY,0,0,0); add_end(); }
+    else if(!strcmp(s,"tri_copy")){ scn_clear=img_fb_init=0x0000;
+        static const blt_vtx_t v[6]={
+            TV(5,5,255,0,0,255),  TV(15,5,255,0,0,255),  TV(15,15,255,0,0,255),
+            TV(5,5,255,0,0,255),  TV(15,15,255,0,0,255), TV(5,15,255,0,0,255) };
+        add_trilist(0xFFFF, BLT_BLEND_COPY, 255, v, 2); add_end(); }
+    else if(!strcmp(s,"tri_alpha")){ scn_clear=img_fb_init=0x001F; /* blue bg */
+        static const blt_vtx_t v[6]={
+            TV(0,0,255,0,0,128),  TV(20,0,255,0,0,128),  TV(20,20,255,0,0,128),
+            TV(0,0,255,0,0,128),  TV(20,20,255,0,0,128), TV(0,20,255,0,0,128) };
+        add_trilist(0xFFFF, BLT_BLEND_CONST_ALPHA, 255, v, 2); add_end(); }
+    else if(!strcmp(s,"tri_overlap")){ scn_clear=img_fb_init=0x001F; /* blue bg */
+        h_start(); uint32_t tex=h_tex1(0xFFFF);
+        static const blt_vtx_t A[6]={
+            TVU(5,5,0,0,255,0,0,128),  TVU(15,5,0,0,255,0,0,128),  TVU(15,15,0,0,255,0,0,128),
+            TVU(5,5,0,0,255,0,0,128),  TVU(15,15,0,0,255,0,0,128), TVU(5,15,0,0,255,0,0,128) };
+        static const blt_vtx_t B[6]={
+            TVU(10,10,0,0,0,255,0,128), TVU(20,10,0,0,0,255,0,128), TVU(20,20,0,0,0,255,0,128),
+            TVU(10,10,0,0,0,255,0,128), TVU(20,20,0,0,0,255,0,128), TVU(10,20,0,0,0,255,0,128) };
+        uint32_t ea=h_verts(A,2), eb=h_verts(B,2);
+        add_tri(BLT_BLEND_CONST_ALPHA,255,tex,1,1,2,ea,2);
+        add_tri(BLT_BLEND_CONST_ALPHA,255,tex,1,1,2,eb,2); add_end(); }
+    else if(!strcmp(s,"tri_add")){ scn_clear=img_fb_init=0x0000;
+        h_start(); uint32_t tex=h_tex1(0xFFFF);
+        static const blt_vtx_t A[6]={
+            TVU(5,5,0,0,128,0,0,255),  TVU(15,5,0,0,128,0,0,255),  TVU(15,15,0,0,128,0,0,255),
+            TVU(5,5,0,0,128,0,0,255),  TVU(15,15,0,0,128,0,0,255), TVU(5,15,0,0,128,0,0,255) };
+        static const blt_vtx_t B[6]={
+            TVU(10,10,0,0,128,0,0,255), TVU(20,10,0,0,128,0,0,255), TVU(20,20,0,0,128,0,0,255),
+            TVU(10,10,0,0,128,0,0,255), TVU(20,20,0,0,128,0,0,255), TVU(10,20,0,0,128,0,0,255) };
+        uint32_t ea=h_verts(A,2), eb=h_verts(B,2);
+        add_tri(BLT_BLEND_ADD,255,tex,1,1,2,ea,2);
+        add_tri(BLT_BLEND_ADD,255,tex,1,1,2,eb,2); add_end(); }
+    else if(!strcmp(s,"tri_clip")){ scn_clear=img_fb_init=0x0000;
+        h_start(); uint32_t tex=h_tex1(0xFFFF);
+        static const blt_vtx_t T[3]={
+            TVU(-10,5,0,0,255,0,0,255), TVU(10,5,0,0,255,0,0,255), TVU(10,25,0,0,255,0,0,255) };
+        uint32_t e=h_verts(T,1); add_tri(BLT_BLEND_COPY,255,tex,1,1,2,e,1); add_end(); }
+    else if(!strcmp(s,"tri_rot")){ scn_clear=img_fb_init=0x0000;
+        h_start(); uint32_t tex=h_tex_checker4();
+        static const blt_vtx_t q[6]={
+            TVU(30,20,0,0,255,255,255,255),  TVU(40,30,64,0,255,255,255,255),  TVU(30,40,64,64,255,255,255,255),
+            TVU(30,20,0,0,255,255,255,255),  TVU(30,40,64,64,255,255,255,255), TVU(20,30,0,64,255,255,255,255) };
+        uint32_t e=h_verts(q,2); add_tri(BLT_BLEND_COPY,255,tex,4,4,8,e,2); add_end(); }
     else { fprintf(stderr,"unknown scenario '%s'\n",s); return -1; }
     return 0;
 }

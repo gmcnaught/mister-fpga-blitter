@@ -57,9 +57,13 @@ module blitter_top #(
         S_FRAME_VCTRL=6'd20, S_WR_DONE=6'd21, S_WR_STATUS=6'd22,
         S_RD_WAIT=6'd23,    S_WR_WAIT=6'd24,
         S_BSETUP=6'd25,     // isolated source-base multiply (timing)
-        S_BLIT_BLEND2=6'd26;// 2nd blend stage: /255 reduce + RGB565 pack (timing)
+        S_BLIT_BLEND2=6'd26,// 2nd blend stage: /255 reduce + RGB565 pack (timing)
+        // [MFGPU] BLT_OP_TRILIST states
+        S_TRI_VFETCH=6'd27, S_TRI_VCOLLECT=6'd28, S_TRI_DECV=6'd29,
+        S_TRI_SETUP=6'd30,  S_TRI_PIX=6'd31, S_TRI_GOTTEX=6'd32,
+        S_TRI_GOTDST=6'd33, S_TRI_WR=6'd34, S_TRI_ADV=6'd35;
 
-    localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3;
+    localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3, OP_TRILIST=8'd8;
     localparam [7:0] BLEND_KEY=8'd1, BLEND_ALPHA=8'd2, BLEND_PALPHA=8'd3;
     localparam [7:0] F_HFLIP=8'h01, F_VFLIP=8'h02, F_COLORKEY=8'h04;
     // Source pixel formats (cmd.format). RGB565 keeps the v1 16bpp addressing;
@@ -175,6 +179,57 @@ module blitter_top #(
     // video control word (drop-in producer): frame_counter[31:2] | buf[1:0]
     wire [31:0] vctrl_val = ((frame_counter + 32'd1) << 2) | {31'd0, target_buf};
 
+    // ==== [MFGPU] BLT_OP_TRILIST ============================================
+    reg  [15:0] tri_idx, tri_count;
+    reg  [31:0] entry_qw_base;                 // SRC_QW + entry_off/8
+    reg  [2:0]  vfetch_k;
+    reg  [63:0] vqw [0:5];                      // 3 verts x 2 qwords
+    reg  signed [15:0] tvx0,tvy0, tvx1,tvy1, tvx2,tvy2;
+    reg  [15:0] tvu0,tvv0, tvu1,tvv1, tvu2,tvv2;
+    reg  [7:0]  tvr0,tvg0,tvb0,tva0, tvr1,tvg1,tvb1,tva1, tvr2,tvg2,tvb2,tva2;
+    reg  [15:0] txmin,txmax,tymin,tymax, tpx,tpy;
+    reg  [15:0] tri_texel, tri_dst;
+
+    wire        tri_hit, tri_we;
+    wire [15:0] tri_tu, tri_tv, tri_out;
+    wire [7:0]  tri_cr, tri_cg, tri_cb, tri_ca;
+    blt_tri u_tri (
+        .vx0(tvx0),.vy0(tvy0),.vx1(tvx1),.vy1(tvy1),.vx2(tvx2),.vy2(tvy2),
+        .vu0(tvu0),.vv0(tvv0),.vu1(tvu1),.vv1(tvv1),.vu2(tvu2),.vv2(tvv2),
+        .vr0(tvr0),.vg0(tvg0),.vb0(tvb0),.va0(tva0),
+        .vr1(tvr1),.vg1(tvg1),.vb1(tvb1),.va1(tva1),
+        .vr2(tvr2),.vg2(tvg2),.vb2(tvb2),.va2(tva2),
+        .tex_w(c_src_x),.tex_h(c_src_y), .px(tpx),.py(tpy),
+        .hit(tri_hit),.tu(tri_tu),.tv(tri_tv),
+        .cr(tri_cr),.cg(tri_cg),.cb(tri_cb),.ca(tri_ca),
+        .texel(tri_texel),.dst(tri_dst),
+        .g_alpha(c_alpha),.blend_mode(c_blend),.colorkey(c_colorkey),
+        .write_en(tri_we),.out_pix(tri_out)
+    );
+    // texel address (bytes -> qword + half-word lane), src heap base at SRC_QW
+    wire [31:0] tex_byte = c_src_off + tri_tv*c_src_stride + {15'd0, tri_tu, 1'b0};
+    wire [31:0] tex_qw   = `SRC_QW + (tex_byte >> 3);
+    wire [5:0]  tex_sh   = {tex_byte[2:1], 4'b0};
+    // TRILIST dst address (tpy*320 + tpx)
+    wire [31:0] tri_dpidx = tpy*`FB_W + tpx;
+    wire [31:0] tri_dqw   = target_base + (tri_dpidx >> 2);
+    wire [5:0]  tri_dsh   = {tri_dpidx[1:0], 4'b0};
+    wire [7:0]  tri_dbe   = 8'h03 << {tri_dpidx[1:0], 1'b0};
+    // bounding box: min/max of the 3 signed vertex coords, >>4, clamped to FB
+    wire signed [15:0] tvminx = (tvx0<tvx1)?((tvx0<tvx2)?tvx0:tvx2):((tvx1<tvx2)?tvx1:tvx2);
+    wire signed [15:0] tvmaxx = (tvx0>tvx1)?((tvx0>tvx2)?tvx0:tvx2):((tvx1>tvx2)?tvx1:tvx2);
+    wire signed [15:0] tvminy = (tvy0<tvy1)?((tvy0<tvy2)?tvy0:tvy2):((tvy1<tvy2)?tvy1:tvy2);
+    wire signed [15:0] tvmaxy = (tvy0>tvy1)?((tvy0>tvy2)?tvy0:tvy2):((tvy1>tvy2)?tvy1:tvy2);
+    wire signed [31:0] bb_minx = $signed(tvminx) >>> 4;
+    wire signed [31:0] bb_maxx = ($signed(tvmaxx) + 32'sd15) >>> 4;
+    wire signed [31:0] bb_miny = $signed(tvminy) >>> 4;
+    wire signed [31:0] bb_maxy = ($signed(tvmaxy) + 32'sd15) >>> 4;
+    wire signed [31:0] cl_minx = (bb_minx < 0) ? 32'sd0 : bb_minx;
+    wire signed [31:0] cl_maxx = (bb_maxx > (`FB_W-1)) ? (`FB_W-1) : bb_maxx;
+    wire signed [31:0] cl_miny = (bb_miny < 0) ? 32'sd0 : bb_miny;
+    wire signed [31:0] cl_maxy = (bb_maxy > (`FB_H-1)) ? (`FB_H-1) : bb_maxy;
+    wire tri_empty = (cl_minx>cl_maxx)||(cl_miny>cl_maxy)||(cl_maxx<0)||(cl_maxy<0);
+
     always @(posedge clk) begin
         if (rst) begin
             state<=S_POLL_SUBMIT; mem_rd<=0; mem_wr<=0; mem_be<=0;
@@ -267,6 +322,14 @@ module blitter_top #(
             S_SETUP: begin
                 if (c_opcode==OP_END)       state<=S_FRAME_VCTRL;
                 else if (c_opcode==OP_NOP)  state<=S_NEXT_CMD;
+                else if (c_opcode==OP_TRILIST) begin
+                    // [MFGPU] TRILIST: dst_x|dst_y<<16 = vertex entry byte offset,
+                    // w = triangle count. (The rect-clip `empty` is meaningless here.)
+                    tri_count     <= c_w;
+                    entry_qw_base <= `SRC_QW + ({c_dst_y, c_dst_x} >> 3);
+                    tri_idx       <= 16'd0;
+                    state         <= S_TRI_VFETCH;
+                end
                 else if (empty)             state<=S_NEXT_CMD;
                 else begin
                     x0r<=clip_x0; y0r<=clip_y0; x1r<=clip_x1; y1r<=clip_y1;
@@ -354,6 +417,71 @@ module blitter_top #(
                     state<=is_fill?S_FILL_WR:S_BLIT_RDSRC;
                 end
             end
+            // ==== [MFGPU] BLT_OP_TRILIST — vertex fetch, raster, blend, write ====
+            S_TRI_VFETCH: begin
+                if (tri_idx >= tri_count) state<=S_NEXT_CMD;
+                else begin
+                    vfetch_k<=3'd0; mem_rd<=1; mem_addr<=entry_qw_base + tri_idx*6;
+                    rd_ret<=S_TRI_VCOLLECT; state<=S_RD_WAIT;
+                end
+            end
+            S_TRI_VCOLLECT: begin
+                vqw[vfetch_k]<=rd_data;
+                if (vfetch_k==3'd5) state<=S_TRI_DECV;
+                else begin
+                    mem_rd<=1; mem_addr<=entry_qw_base + tri_idx*6 + vfetch_k + 3'd1;
+                    vfetch_k<=vfetch_k+3'd1; rd_ret<=S_TRI_VCOLLECT; state<=S_RD_WAIT;
+                end
+            end
+            S_TRI_DECV: begin
+                // vertex qword layout (LE): qw0 = {v,u,y,x}; qw1[31:0] = rgba (r|g<<8|b<<16|a<<24)
+                tvx0<=vqw[0][15:0]; tvy0<=vqw[0][31:16]; tvu0<=vqw[0][47:32]; tvv0<=vqw[0][63:48];
+                tvr0<=vqw[1][7:0];  tvg0<=vqw[1][15:8];  tvb0<=vqw[1][23:16]; tva0<=vqw[1][31:24];
+                tvx1<=vqw[2][15:0]; tvy1<=vqw[2][31:16]; tvu1<=vqw[2][47:32]; tvv1<=vqw[2][63:48];
+                tvr1<=vqw[3][7:0];  tvg1<=vqw[3][15:8];  tvb1<=vqw[3][23:16]; tva1<=vqw[3][31:24];
+                tvx2<=vqw[4][15:0]; tvy2<=vqw[4][31:16]; tvu2<=vqw[4][47:32]; tvv2<=vqw[4][63:48];
+                tvr2<=vqw[5][7:0];  tvg2<=vqw[5][15:8];  tvb2<=vqw[5][23:16]; tva2<=vqw[5][31:24];
+                state<=S_TRI_SETUP;
+            end
+            S_TRI_SETUP: begin
+                if (tri_empty) begin tri_idx<=tri_idx+16'd1; state<=S_TRI_VFETCH; end
+                else begin
+                    txmin<=cl_minx[15:0]; txmax<=cl_maxx[15:0];
+                    tymin<=cl_miny[15:0]; tymax<=cl_maxy[15:0];
+                    tpx<=cl_minx[15:0];   tpy<=cl_miny[15:0];
+                    state<=S_TRI_PIX;
+                end
+            end
+            S_TRI_PIX: begin
+                if (!tri_hit) state<=S_TRI_ADV;   // pixel center outside the triangle
+                else begin mem_rd<=1; mem_addr<=tex_qw; rd_ret<=S_TRI_GOTTEX; state<=S_RD_WAIT; end
+            end
+            S_TRI_GOTTEX: begin
+                tri_texel <= rd_data[tex_sh +: 16];
+                // CONST_ALPHA(2)/ADD(4)/MULTIPLY(5) need the current dst pixel; COPY/KEY don't
+                if ((c_blend==BLEND_ALPHA)||(c_blend==8'd4)||(c_blend==8'd5)) begin
+                    mem_rd<=1; mem_addr<=tri_dqw; rd_ret<=S_TRI_GOTDST; state<=S_RD_WAIT;
+                end else state<=S_TRI_WR;
+            end
+            S_TRI_GOTDST: begin
+                tri_dst <= rd_data[tri_dsh +: 16];
+                state<=S_TRI_WR;
+            end
+            S_TRI_WR: begin
+                if (tri_we) begin
+                    mem_wr<=1; mem_be<=tri_dbe; mem_addr<=tri_dqw;
+                    mem_din<=({48'd0, tri_out} << tri_dsh);
+                    wr_ret<=S_TRI_ADV; state<=S_WR_WAIT;
+                end else state<=S_TRI_ADV;
+            end
+            S_TRI_ADV: begin
+                if (tpx >= txmax) begin
+                    tpx<=txmin;
+                    if (tpy >= tymax) begin tri_idx<=tri_idx+16'd1; state<=S_TRI_VFETCH; end
+                    else begin tpy<=tpy+16'd1; state<=S_TRI_PIX; end
+                end else begin tpx<=tpx+16'd1; state<=S_TRI_PIX; end
+            end
+
             S_NEXT_CMD: begin cmd_idx<=cmd_idx+1; state<=S_FETCH; end
 
             S_FRAME_VCTRL: begin

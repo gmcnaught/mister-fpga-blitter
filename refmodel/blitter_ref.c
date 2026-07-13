@@ -276,6 +276,18 @@ int blt_execute(uint16_t *fb,
             continue;
         }
 
+        if (c->opcode == BLT_OP_TRILIST) {
+            /* [MFGPU] textured-triangle list. Header dst_x|dst_y<<16 = byte offset
+             * of the first vertex in the entry buffer (same entry-offset convention
+             * as BLT_OP_TILELIST_RES above); w = triangle count. Vertices are
+             * blt_vtx_t triples resident in the source heap. */
+            uint32_t entry_off = (uint32_t)(uint16_t)c->dst_x
+                               | ((uint32_t)(uint16_t)c->dst_y << 16);
+            const blt_vtx_t *tris = (const blt_vtx_t *)(heap->base + entry_off);
+            blt_raster_tri(fb, heap, c, tris, (int)c->w);
+            continue;
+        }
+
         if (c->opcode == BLT_OP_FRT_UPLOAD) continue;  /* table preload: no FB effect */
 
         if (c->opcode == BLT_OP_TILELIST_RES) {

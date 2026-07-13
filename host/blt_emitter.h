@@ -59,6 +59,12 @@ typedef struct {
     size_t   tl_cap;     /* capacity in bytes                                     */
     size_t   tl_used;    /* bytes used this frame (reset in blt_begin_frame)      */
 
+    /* [MFGPU] TRILIST vertex entry buffer (separate from ring + heap; caller-owned).
+     * Holds blt_vtx_t triples for BLT_OP_TRILIST; per-frame, reset in blt_begin_frame. */
+    uint8_t *vtx_buf;    /* vertex entry buffer (source-DDR region; malloc in tests) */
+    size_t   vtx_cap;    /* capacity in bytes                                        */
+    size_t   vtx_used;   /* bytes used this frame (reset in blt_begin_frame)         */
+
     int      cmd_count;  /* commands emitted this frame (excl. END until end_frame) */
     int      overflow;   /* set if a ring/heap capacity was exceeded   */
 
@@ -218,6 +224,25 @@ int blt_tile_list_static(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
  * qwords of the frame-rect table from the FRT DDR region into its frt BRAM (once/scene).
  * Returns 0, or -1 + e->overflow on ring full. */
 int blt_frt_upload(blt_emitter_t *e, uint32_t qword_count);
+
+/* ── [MFGPU] BLT_OP_TRILIST — textured-triangle lists (GLES front-end) ──────── */
+
+/* Bind the per-frame vertex entry buffer (separate from ring + source heap;
+ * caller-owned). blt_push_tris appends blt_vtx_t here; the cursor resets each
+ * frame in blt_begin_frame. */
+void blt_vtx_buf_init(blt_emitter_t *e, void *vtx_buf, size_t vtx_cap);
+
+/* Bump-append ntris*3 vertices to the vertex buffer. Returns the byte offset of
+ * the first vertex (the entry_off passed to blt_trilist), or 0xFFFFFFFF on
+ * overflow (also sets e->overflow). */
+uint32_t blt_push_tris(blt_emitter_t *e, const blt_vtx_t *tris, int ntris);
+
+/* Emit one header-only BLT_OP_TRILIST command into the ring, pointing at
+ * `entry_off` (ntris*3 blt_vtx_t resident in the vertex buffer). Texture-page
+ * params (offset/stride/width/height/format) come from `tex`; `w`=ntris,
+ * dst_x|dst_y<<16 = entry_off. Returns 0, or -1 + e->overflow on ring full. */
+int blt_trilist(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
+                uint16_t colorkey, uint8_t alpha, uint32_t entry_off, int ntris);
 
 #ifdef __cplusplus
 }
