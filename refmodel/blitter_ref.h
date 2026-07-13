@@ -85,6 +85,10 @@ enum {
                           * from DDR (FRT region) into the fabric's frt BRAM. Header: *
                           *   w | h<<16 = qword count to copy. No framebuffer effect. *
                           * (Software ref model: tables are plain memory -> no-op.)   */
+    BLT_OP_TRILIST      = 8, /* [MFGPU] textured-triangle list (GLES front-end). Header *
+                          * carries texture-page params; dst_x|dst_y<<16 = byte offset  *
+                          * of the first vertex in the entry buffer; w = triangle count.*
+                          * Vertices are blt_vtx_t triples (see below). */
 };
 
 /* [#52 resident / Tier B] resident table dimensions (host + RTL MUST agree; mirrored
@@ -171,6 +175,27 @@ typedef struct {
 } blt_cmd_t;
 
 /*
+ *  BLT_OP_TRILIST vertex (16 bytes, on-wire little-endian). Emitted in triples
+ *  (one triangle = 3 consecutive verts) into the entry buffer; the header's
+ *  dst_x|dst_y<<16 gives the byte offset of the first vertex, w = triangle count.
+ *    x,y : screen position, signed 12.4 fixed-point (pixels<<4).
+ *    u,v : texel coordinate, unsigned 12.4 fixed-point (texels<<4).
+ *    rgba: per-vertex color, packed r | g<<8 | b<<16 | a<<24 (see BLT_RGBA).
+ *  The A9 front-end (libmfgpu) does transform/clip/cull and emits these; the
+ *  fabric interpolates, samples, modulates by the vertex color, and blends.
+ */
+typedef struct {
+    int16_t  x, y;     /* screen pos, 12.4 signed   */
+    uint16_t u, v;     /* texel coord, 12.4 unsigned */
+    uint32_t rgba;     /* r | g<<8 | b<<16 | a<<24  */
+    uint32_t _rsvd;    /* 0 (pads to 16 bytes)      */
+} blt_vtx_t;
+
+/* Pack per-vertex color for blt_vtx_t.rgba. */
+#define BLT_RGBA(r,g,b,a) ((uint32_t)(uint8_t)(r) | ((uint32_t)(uint8_t)(g)<<8) \
+                          | ((uint32_t)(uint8_t)(b)<<16) | ((uint32_t)(uint8_t)(a)<<24))
+
+/*
  *  BLT_OP_TILELIST per-tile entry (12 bytes, on-wire little-endian).
  */
 typedef struct {
@@ -238,6 +263,17 @@ int blt_execute(uint16_t *fb,
                 const blt_surface_heap_t *heap,
                 const blt_cmd_t *cmds,
                 int count);
+
+/*
+ *  Rasterize a textured-triangle list into the framebuffer (BLT_OP_TRILIST).
+ *    fb   : BLT_FB_PIXELS uint16 framebuffer (composited in place)
+ *    heap : source heap; texture page at h->src_off (RGB565), h->src_stride bytes/row
+ *    h    : the TRILIST header command (blend_mode, format, tex params, colorkey, alpha)
+ *    tris : ntris*3 vertices, one triangle per consecutive triple
+ *  Golden spec for the RTL blt_tri module (defined in blt_tri.c).
+ */
+void blt_raster_tri(uint16_t *fb, const blt_surface_heap_t *heap,
+                    const blt_cmd_t *h, const blt_vtx_t *tris, int ntris);
 
 /* Convenience: RGB565 pack/blend helpers (also used by tests). */
 uint16_t blt_rgb565(uint8_t r, uint8_t g, uint8_t b);

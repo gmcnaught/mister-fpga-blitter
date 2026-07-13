@@ -89,4 +89,27 @@ static inline void blt_unpack_cmd(const uint8_t in[BLT_CMD_BYTES], blt_cmd_t *c)
     c->_pad[1]    = (u7>>24) & 0xFF;   /* cg */
 }
 
+/*
+ *  BLT_OP_TRILIST header field mapping (into blt_cmd_t / the 32-byte wire word).
+ *  The triangle list itself lives in a separate vertex entry buffer (blt_vtx_t
+ *  triples); the header only points at it and carries the shared draw params:
+ *
+ *    opcode      = BLT_OP_TRILIST (8)
+ *    blend_mode  = BLT_BLEND_*  (COPY / CONST_ALPHA / ADD / MULTIPLY / COLORKEY)
+ *    format      = BLT_FMT_*    (texture page format)
+ *    src_off     = texture page base byte offset in the source heap
+ *    src_stride  = texture row stride in bytes
+ *    src_x       = texture width  in texels
+ *    src_y       = texture height in texels
+ *    w           = triangle count
+ *    dst_x       = entry_off & 0xFFFF        \ byte offset of the first vertex
+ *    dst_y       = (entry_off >> 16) & 0xFFFF / in the entry buffer
+ *    colorkey    = RGB565 transparent key (COLORKEY mode)
+ *    alpha       = global alpha 0..255 (usually 255; scales per-vertex alpha)
+ *
+ *  This reuses the same dst_x|dst_y<<16 = entry byte-offset and w = count
+ *  convention as BLT_OP_TILELIST_RES, so the existing wire codec above already
+ *  round-trips a TRILIST header without change.
+ */
+
 #endif /* BLT_WIRE_H */
