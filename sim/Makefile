@@ -2,7 +2,7 @@
 #   make test    build + run all scenarios (requires iverilog + cc)
 #   make clean
 SCEN = fill copy colorkey alpha hflip vflip clip_neg clip_off overdraw clear target1 \
-       tri_copy tri_alpha
+       tri_copy tri_alpha tri_overlap tri_add tri_clip tri_rot
 
 IVERILOG ?= iverilog
 VVP      ?= vvp
