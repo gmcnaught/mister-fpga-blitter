@@ -13,8 +13,8 @@ test: test_mfgpu test_xform
 	./test_mfgpu
 	./test_xform
 
-test_mfgpu: test_mfgpu.c mfgpu.c $(DEPS) $(HDRS)
-	$(CC) $(CFLAGS) -o $@ test_mfgpu.c mfgpu.c $(DEPS)
+test_mfgpu: test_mfgpu.c mfgpu.c mfgpu_xform.c mfgpu_xform.h $(DEPS) $(HDRS)
+	$(CC) $(CFLAGS) -o $@ test_mfgpu.c mfgpu.c mfgpu_xform.c $(DEPS) -lm
 
 # vertex transform (needs libm for lround)
 test_xform: test_xform.c mfgpu_xform.c mfgpu_xform.h $(HDRS)
