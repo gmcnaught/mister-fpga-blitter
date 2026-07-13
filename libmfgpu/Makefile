@@ -9,13 +9,18 @@ DEPS   = ../host/blt_emitter.c ../host/blt_alloc.c \
          ../refmodel/blitter_ref.c ../refmodel/blt_tri.c
 HDRS   = mfgpu.h ../host/blt_emitter.h ../host/blt_wire.h ../refmodel/blitter_ref.h
 
-test: test_mfgpu
+test: test_mfgpu test_xform
 	./test_mfgpu
+	./test_xform
 
 test_mfgpu: test_mfgpu.c mfgpu.c $(DEPS) $(HDRS)
 	$(CC) $(CFLAGS) -o $@ test_mfgpu.c mfgpu.c $(DEPS)
 
+# vertex transform (needs libm for lround)
+test_xform: test_xform.c mfgpu_xform.c mfgpu_xform.h $(HDRS)
+	$(CC) $(CFLAGS) -o $@ test_xform.c mfgpu_xform.c -lm
+
 clean:
-	rm -f test_mfgpu
+	rm -f test_mfgpu test_xform
 
 .PHONY: test clean
