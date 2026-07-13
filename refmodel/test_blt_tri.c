@@ -56,5 +56,34 @@ static void test_alpha_blend_half(void){
     printf("test_alpha_blend_half OK\n");
 }
 
+/* End-to-end: a TRILIST header in a command list, vertices in the entry buffer,
+ * driven through blt_execute — same result as calling blt_raster_tri directly. */
+static void test_trilist_via_execute(void){
+    enum { ENTRY_OFF = 16 };   /* first vertex sits past the 2-byte tex, 16B-aligned */
+    uint8_t heapbuf[ENTRY_OFF + 6*sizeof(blt_vtx_t)];
+    memset(heapbuf,0,sizeof heapbuf);
+    heapbuf[0]=0xff; heapbuf[1]=0xff;                 /* 1x1 white tex at offset 0 */
+    blt_vtx_t tris[6] = {
+        V(5,5,255,0,0,255),  V(15,5,255,0,0,255),  V(15,15,255,0,0,255),
+        V(5,5,255,0,0,255),  V(15,15,255,0,0,255), V(5,15,255,0,0,255),
+    };
+    memcpy(heapbuf+ENTRY_OFF, tris, sizeof tris);
+    blt_surface_heap_t heap; memset(&heap,0,sizeof heap);
+    heap.base=heapbuf; heap.size=sizeof heapbuf;
+
+    uint16_t fb[BLT_FB_WIDTH*BLT_FB_HEIGHT]; memset(fb,0,sizeof fb);
+    blt_cmd_t cmds[2]; memset(cmds,0,sizeof cmds);
+    cmds[0]=mk_hdr(BLT_BLEND_COPY);
+    cmds[0].w=2;                                      /* triangle count */
+    cmds[0].dst_x=(int16_t)(ENTRY_OFF & 0xFFFF);     /* entry_off low  */
+    cmds[0].dst_y=(int16_t)(ENTRY_OFF >> 16);        /* entry_off high */
+    cmds[1].opcode=BLT_OP_END;
+    blt_execute(fb, &heap, cmds, 2);
+    assert(fb[10*BLT_FB_WIDTH+10]==0xF800);          /* interior red */
+    assert(fb[10*BLT_FB_WIDTH+15]==0x0000);          /* right edge exclusive */
+    printf("test_trilist_via_execute OK\n");
+}
+
 int main(void){ test_solid_red_quad_copy(); test_alpha_blend_half();
+    test_trilist_via_execute();
     printf("ALL blt_tri tests OK\n"); return 0; }
