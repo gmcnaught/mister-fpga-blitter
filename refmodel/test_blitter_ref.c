@@ -220,7 +220,7 @@ static void test_end_and_overdraw(void)
 
 static void test_trilist_layout(void){
     assert(sizeof(blt_vtx_t) == 16);
-    assert(BLT_OP_TRILIST == 8);
+    assert(BLT_OP_TRILIST == 10);
     blt_vtx_t v = { .x=1, .y=2, .u=3, .v=4, .rgba=BLT_RGBA(10,20,30,40), ._rsvd=0 };
     assert((v.rgba & 0xff)==10 && ((v.rgba>>24)&0xff)==40);
     printf("test_trilist_layout OK\n");

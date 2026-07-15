@@ -63,7 +63,7 @@ module blitter_top #(
         S_TRI_SETUP=6'd30,  S_TRI_PIX=6'd31, S_TRI_GOTTEX=6'd32,
         S_TRI_GOTDST=6'd33, S_TRI_WR=6'd34, S_TRI_ADV=6'd35;
 
-    localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3, OP_TRILIST=8'd8;
+    localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3, OP_TRILIST=8'd10;
     localparam [7:0] BLEND_KEY=8'd1, BLEND_ALPHA=8'd2, BLEND_PALPHA=8'd3;
     localparam [7:0] F_HFLIP=8'h01, F_VFLIP=8'h02, F_COLORKEY=8'h04;
     // Source pixel formats (cmd.format). RGB565 keeps the v1 16bpp addressing;

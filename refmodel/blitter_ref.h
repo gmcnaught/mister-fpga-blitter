@@ -85,7 +85,7 @@ enum {
                           * from DDR (FRT region) into the fabric's frt BRAM. Header: *
                           *   w | h<<16 = qword count to copy. No framebuffer effect. *
                           * (Software ref model: tables are plain memory -> no-op.)   */
-    BLT_OP_TRILIST      = 8, /* [MFGPU] textured-triangle list (GLES front-end). Header *
+    BLT_OP_TRILIST      = 10, /* [MFGPU] textured-triangle list (GLES front-end). Header *
                           * carries texture-page params; dst_x|dst_y<<16 = byte offset  *
                           * of the first vertex in the entry buffer; w = triangle count.*
                           * Vertices are blt_vtx_t triples (see below). */
