@@ -248,7 +248,7 @@ int blt_execute(uint16_t *fb,
         if (c->opcode == BLT_OP_NOP)  continue;
         if (c->opcode == BLT_OP_STAGE) continue; /* DDR->SDRAM stage: no FB effect */
         if (c->opcode == BLT_OP_SET_TARGET) {
-            dst = ((c->color & 0xFFu) == BLT_TARGET_APPSURF) ? appsurf : fb;
+            dst = ((c->color & 0x3u) == BLT_TARGET_APPSURF) ? appsurf : fb;
             continue;
         }
 
