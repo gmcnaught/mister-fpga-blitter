@@ -31,7 +31,7 @@ static void test_solid_red_quad_copy(void){
         V(5,5,255,0,0,255),  V(15,5,255,0,0,255),  V(15,15,255,0,0,255),
         V(5,5,255,0,0,255),  V(15,15,255,0,0,255), V(5,15,255,0,0,255),
     };
-    blt_raster_tri(fb, &heap, &h, tris, 2);
+    blt_raster_tri(fb, &heap, &h, tris, 2, NULL);
     /* interior pixel (10,10) must be red 0xF800; a pixel outside (0,0) must be 0 */
     assert(fb[10*BLT_FB_WIDTH+10]==0xF800);
     assert(fb[0]==0x0000);
@@ -49,7 +49,7 @@ static void test_alpha_blend_half(void){
         V(0,0,255,0,0,128),  V(20,0,255,0,0,128),  V(20,20,255,0,0,128),
         V(0,0,255,0,0,128),  V(20,20,255,0,0,128), V(0,20,255,0,0,128),
     };
-    blt_raster_tri(fb, &heap, &h, tris, 2);
+    blt_raster_tri(fb, &heap, &h, tris, 2, NULL);
     uint16_t got = fb[10*BLT_FB_WIDTH+10];
     uint16_t expect = blt_blend565(0xF800, 0x001F, 128);
     assert(got==expect);
@@ -94,11 +94,11 @@ static void test_overlap_order(void){
     blt_vtx_t A[6] = {
         V(5,5,255,0,0,128),  V(15,5,255,0,0,128),  V(15,15,255,0,0,128),
         V(5,5,255,0,0,128),  V(15,15,255,0,0,128), V(5,15,255,0,0,128) };
-    blt_raster_tri(fb,&heap,&h,A,2);
+    blt_raster_tri(fb,&heap,&h,A,2, NULL);
     blt_vtx_t B[6] = {
         V(10,10,0,255,0,128), V(20,10,0,255,0,128), V(20,20,0,255,0,128),
         V(10,10,0,255,0,128), V(20,20,0,255,0,128), V(10,20,0,255,0,128) };
-    blt_raster_tri(fb,&heap,&h,B,2);
+    blt_raster_tri(fb,&heap,&h,B,2, NULL);
     uint16_t afterA = blt_blend565(0xF800, 0x001F, 128);       /* red over blue   */
     uint16_t expect = blt_blend565(0x07E0, afterA, 128);       /* green over that */
     assert(fb[12*BLT_FB_WIDTH+12]==expect);                    /* overlap         */
@@ -114,11 +114,11 @@ static void test_additive(void){
     blt_vtx_t A[6] = {
         V(5,5,128,0,0,255),  V(15,5,128,0,0,255),  V(15,15,128,0,0,255),
         V(5,5,128,0,0,255),  V(15,15,128,0,0,255), V(5,15,128,0,0,255) };
-    blt_raster_tri(fb,&heap,&h,A,2);
+    blt_raster_tri(fb,&heap,&h,A,2, NULL);
     blt_vtx_t B[6] = {
         V(10,10,128,0,0,255), V(20,10,128,0,0,255), V(20,20,128,0,0,255),
         V(10,10,128,0,0,255), V(20,20,128,0,0,255), V(10,20,128,0,0,255) };
-    blt_raster_tri(fb,&heap,&h,B,2);
+    blt_raster_tri(fb,&heap,&h,B,2, NULL);
     uint16_t src    = blt_tint565(0xFFFF,128,0,0);             /* white*red-mod   */
     uint16_t afterA = blt_add565(src, 0x0000);
     uint16_t expect = blt_add565(src, afterA);
@@ -135,7 +135,7 @@ static void test_offscreen_clip(void){
     blt_cmd_t h = mk_hdr(BLT_BLEND_COPY);
     /* right triangle: (-10,5),(10,5),(10,25) — left half is off-screen (x<0) */
     blt_vtx_t T[3] = { V(-10,5,255,0,0,255), V(10,5,255,0,0,255), V(10,25,255,0,0,255) };
-    blt_raster_tri(fb,&heap,&h,T,1);
+    blt_raster_tri(fb,&heap,&h,T,1, NULL);
     assert(fb[10*BLT_FB_WIDTH+5]==0xF800);   /* interior on-screen pixel filled  */
     assert(fb[0]==0x0000);                   /* (0,0) above the triangle: bg      */
     assert(fb[10*BLT_FB_WIDTH+12]==0x0000);  /* x>10 (right of the triangle): bg  */
@@ -163,7 +163,7 @@ static void test_rotated_quad(void){
         VT(30,20, 0,0),  VT(40,30, 64,0),  VT(30,40, 64,64),
         VT(30,20, 0,0),  VT(30,40, 64,64), VT(20,30, 0,64) };
 #undef VT
-    blt_raster_tri(fb,&heap,&h,q,2);
+    blt_raster_tri(fb,&heap,&h,q,2, NULL);
     uint16_t c = fb[30*BLT_FB_WIDTH+30];
     assert(c==0xF800 || c==0x07E0);          /* centre covered by a checker texel */
     assert(fb[0]==0x0000);                   /* far corner: background            */

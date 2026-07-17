@@ -101,7 +101,11 @@ enum {
  * Matches RTL target_buf (fpga/rtl/blitter_top.sv): 0/1 = WORK framebuffer
  * double-buffer (today's default target, unchanged), 2 = the off-screen
  * application-surface BRAM surface (composite write/read only; never
- * scanned out). */
+ * scanned out). [step 1, Task 3] The reference model (blt_execute) sizes
+ * the app-surface buffer as a fixed BLT_FB_WIDTH x BLT_FB_HEIGHT (320x240)
+ * RGB565 buffer -- a superset of the real used region (<=320x240 per Task 1's
+ * measured 288x216) -- to avoid stride/dimension bookkeeping the RTL's fixed
+ * BRAM size doesn't need either. */
 #define BLT_TARGET_WORK    0u
 #define BLT_TARGET_APPSURF 2u
 
@@ -161,12 +165,16 @@ enum {
                                 * source, instead of the normal DDR3/SDRAM texture-page path
                                 * (src_off/src_stride/src_x/src_y are ignored when set — the
                                 * surface is always BLT_TARGET_APPSURF's full extent).
-                                * Conceptually a sibling of BLT_F_SRC_FB (0x20, "read a
-                                * compositor-written framebuffer via P_SRC") but sources the
-                                * SECOND (app-surface) BRAM buffer rather than the WORK
-                                * double-buffer's carry-forward copy; keep semantics
-                                * consistent with BLT_F_SRC_FB's read-after-write-barrier
-                                * discipline. NOTE: this is bit 0x80, not the 0x10 the
+                                * Deliberately SELF-CONTAINED, not modeled on BLT_F_SRC_FB
+                                * (0x20): that flag's RTL path is retired (source simplified
+                                * to unconditional-SDRAM), so this flag/semantics stand on
+                                * their own -- no read-after-write-barrier borrowed from it;
+                                * any ordering hazard between an APPSURF write pass and a
+                                * subsequent BLT_F_SRC_SURFACE read pass is a Task 8 (RTL
+                                * full-frame integration) concern, not modeled here (the
+                                * reference model's command list is executed strictly in
+                                * order, so blt_execute has no hazard to begin with).
+                                * NOTE: this is bit 0x80, not the 0x10 the
                                 * step-1 plan doc originally guessed nor the 0x40 later
                                 * proposed — both are already taken (BLT_F_SRC_SDRAM,
                                 * BLT_F_COLORMOD); 0x80 is the only free bit in the u8
@@ -297,14 +305,21 @@ int blt_execute(uint16_t *fb,
 
 /*
  *  Rasterize a textured-triangle list into the framebuffer (BLT_OP_TRILIST).
- *    fb   : BLT_FB_PIXELS uint16 framebuffer (composited in place)
- *    heap : source heap; texture page at h->src_off (RGB565), h->src_stride bytes/row
- *    h    : the TRILIST header command (blend_mode, format, tex params, colorkey, alpha)
- *    tris : ntris*3 vertices, one triangle per consecutive triple
+ *    fb      : BLT_FB_PIXELS uint16 destination (composited in place) -- WORK or
+ *              the app-surface buffer, selected by blt_execute per BLT_OP_SET_TARGET
+ *    heap    : source heap; texture page at h->src_off (RGB565), h->src_stride bytes/row
+ *    h       : the TRILIST header command (blend_mode, format, tex params, colorkey, alpha)
+ *    tris    : ntris*3 vertices, one triangle per consecutive triple
+ *    surface : [app-surface render target, step 1] the BLT_TARGET_APPSURF buffer
+ *              (BLT_FB_WIDTH x BLT_FB_HEIGHT, same layout as fb), sampled instead of
+ *              `heap` when h->flags & BLT_F_SRC_SURFACE. May be NULL when the caller
+ *              never uses BLT_F_SRC_SURFACE (model-safety: samples as black if NULL
+ *              while the flag is set).
  *  Golden spec for the RTL blt_tri module (defined in blt_tri.c).
  */
 void blt_raster_tri(uint16_t *fb, const blt_surface_heap_t *heap,
-                    const blt_cmd_t *h, const blt_vtx_t *tris, int ntris);
+                    const blt_cmd_t *h, const blt_vtx_t *tris, int ntris,
+                    const uint16_t *surface);
 
 /* Convenience: RGB565 pack/blend helpers (also used by tests). */
 uint16_t blt_rgb565(uint8_t r, uint8_t g, uint8_t b);
