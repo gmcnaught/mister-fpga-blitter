@@ -194,7 +194,7 @@ static void test_emit_trilist_roundtrip(void)
     blt_surface_ref_t tex = { .off=TEX_OFF, .stride=2, .w=1, .h=1,
                               .format=BLT_FMT_RGB565, .valid=1,
                               .sdram_off=BLT_ALLOC_FAIL };
-    CHECK(blt_trilist(&e, tex, BLT_BLEND_COPY, 0, 255, eoff, 2) == 0, "blt_trilist emit ok");
+    CHECK(blt_trilist(&e, tex, BLT_BLEND_COPY, 0, 255, eoff, 2, 0) == 0, "blt_trilist emit ok");
     CHECK(!e.overflow, "no overflow");
 
     uint16_t *fb = run_ring(ring, e.cmd_count, srcdram, sizeof srcdram, 0x0000);
@@ -202,6 +202,17 @@ static void test_emit_trilist_roundtrip(void)
     CHECK(fb[10*BLT_FB_WIDTH+15]==0x0000, "right edge exclusive (top-left rule)");
     free(fb);
     free(ring);
+}
+
+/* ----- BLT_OP_SET_TARGET: opcode + target id round-trip through the wire --- */
+static int test_set_target_roundtrip(void) {
+    uint8_t buf[BLT_CMD_BYTES];
+    blt_cmd_t c = {0}; c.opcode = BLT_OP_SET_TARGET; c.color = BLT_TARGET_APPSURF;
+    blt_pack_cmd(&c, buf);
+    blt_cmd_t d = {0}; blt_unpack_cmd(buf, &d);
+    if (d.opcode != BLT_OP_SET_TARGET) { printf("FAIL opcode %u\n", d.opcode); return 1; }
+    if ((d.color & 0xFF) != BLT_TARGET_APPSURF) { printf("FAIL target %u\n", d.color); return 1; }
+    printf("PASS set_target_roundtrip\n"); return 0;
 }
 
 int main(void)
@@ -212,6 +223,7 @@ int main(void)
     test_heap_persistence();
     test_overflow_guard();
     test_emit_trilist_roundtrip();
+    g_checks++; if (test_set_target_roundtrip()) g_fail++;
     printf("=== %d checks, %d failures ===\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

@@ -64,7 +64,7 @@ int mfgpu_submit_batch(mfgpu_t *m, const mfgpu_batch_t *b){
             blt_surface_ref_t tex; memset(&tex, 0, sizeof tex);
             tex.off=b->tex_off; tex.stride=b->tex_stride;
             tex.w=b->tex_w; tex.h=b->tex_h; tex.format=b->tex_format; tex.valid=1;
-            rc = blt_trilist(m->e, tex, b->blend, 0, 255, eoff, nsurv);
+            rc = blt_trilist(m->e, tex, b->blend, 0, 255, eoff, nsurv, /*flags=*/0);
         }
     }
     free(tris); free(xf);

@@ -89,7 +89,21 @@ enum {
                           * carries texture-page params; dst_x|dst_y<<16 = byte offset  *
                           * of the first vertex in the entry buffer; w = triangle count.*
                           * Vertices are blt_vtx_t triples (see below). */
+    BLT_OP_SET_TARGET   = 11, /* [app-surface render target, step 1] switch the composite
+                          * write/read target among BLT_TARGET_*. cmd.color low byte =
+                          * target id; all other fields unused/zero. Persists until the
+                          * next SET_TARGET (or frame end, which resets to WORK). No
+                          * framebuffer effect of its own — a pure state-set command,
+                          * like BLT_OP_FRT_UPLOAD. */
 };
+
+/* ---- Render targets (BLT_OP_SET_TARGET's cmd.color low byte) ------------
+ * Matches RTL target_buf (fpga/rtl/blitter_top.sv): 0/1 = WORK framebuffer
+ * double-buffer (today's default target, unchanged), 2 = the off-screen
+ * application-surface BRAM surface (composite write/read only; never
+ * scanned out). */
+#define BLT_TARGET_WORK    0u
+#define BLT_TARGET_APPSURF 2u
 
 /* [#52 resident / Tier B] resident table dimensions (host + RTL MUST agree; mirrored
  * in fpga/rtl/blitter_defs.vh). MAXP patterns x MAXF frames. */
@@ -141,6 +155,23 @@ enum {
                                 * (divide-free /255, same reduction as blt_blend565). CLEAR => no mod
                                 * (true no-op; v1 zero-pad stays correct). Host sets it only when
                                 * (cr,cg,cb) != (255,255,255). Orthogonal to blend_mode (composes). */
+#define BLT_F_SRC_SURFACE 0x80u /* [app-surface render target, step 1] TRILIST: sample the
+                                * off-screen application-surface BRAM surface (the
+                                * BLT_TARGET_APPSURF render target) as this draw's texel
+                                * source, instead of the normal DDR3/SDRAM texture-page path
+                                * (src_off/src_stride/src_x/src_y are ignored when set — the
+                                * surface is always BLT_TARGET_APPSURF's full extent).
+                                * Conceptually a sibling of BLT_F_SRC_FB (0x20, "read a
+                                * compositor-written framebuffer via P_SRC") but sources the
+                                * SECOND (app-surface) BRAM buffer rather than the WORK
+                                * double-buffer's carry-forward copy; keep semantics
+                                * consistent with BLT_F_SRC_FB's read-after-write-barrier
+                                * discipline. NOTE: this is bit 0x80, not the 0x10 the
+                                * step-1 plan doc originally guessed nor the 0x40 later
+                                * proposed — both are already taken (BLT_F_SRC_SDRAM,
+                                * BLT_F_COLORMOD); 0x80 is the only free bit in the u8
+                                * flags field. Flagged to the FPGA team for cross-check
+                                * before their side locks against it. */
 
 /*
  *  Blit command — 32 bytes / 8x uint32. Layout is the on-wire DDR ring entry;
