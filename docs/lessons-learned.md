@@ -30,18 +30,33 @@ bit-exact C reference model. Only the *transport* changed.
 6. **Lazy staging → whole-quest SDRAM residency**: all atlases staged once at
    load (with an on-screen progress bar painted with plain FILL commands);
    sources never re-upload mid-game.
+7. **Scan copy → DDR3 double-buffer** (Stage 5 Phase 2, 2026-07): `comp_fbram`
+   was the largest M10K consumer at ~89 % BRAM utilization, so the SCAN half
+   moved back off-chip (~160 M10K freed). WORK stays in BRAM — the RMW win of
+   step 4 is untouched — but at frame-done the fabric burst-writes WORK to the
+   inactive DDR3 framebuffer and flips banks; the reader fetches one 80-qword
+   burst per scanline. The step-2 starvation that drove scanout *off* DDR3
+   doesn't recur because composite traffic no longer touches DDR3 at all
+   (sources in SDRAM, WORK in BRAM) — the bus carries only the two linear
+   streams. Bonus: firing the snapshot immediately at frame-done instead of
+   waiting for vblank was itself a major fps win.
 
-The end state inverts the original framing: the design started as "a blitter
+The end state refines the original framing: the design started as "a blitter
 that writes the framebuffer faster than the CPU" and ended as "a compositor
-whose frame never exists in external memory at all."
+whose frame is *built* entirely on-chip" — external memory only ever sees the
+finished image, once, as a linear burst.
 
 ## Transport and protocol
 
-- **Keep frame pixels off the shared HPS bus.** This is the single most
-  important architectural rule. The f2h bus is shared with Linux, audio, and
-  control traffic; scanout reading through it failed under composite load, and
-  full-frame DMA from the CPU contended with everything. Every performance
+- **Keep per-pixel frame traffic off the shared HPS bus.** This is the single
+  most important architectural rule. The f2h bus is shared with Linux, audio,
+  and control traffic; scanout reading through it failed under composite load,
+  and full-frame DMA from the CPU contended with everything. Every performance
   cliff in the project traced back to frame pixels crossing a shared bus.
+  Stage 5 sharpened the rule's real shape: what the bus cannot absorb is
+  *per-pixel, latency-coupled* traffic (RMW, per-qword scanout under
+  contention) — a once-per-frame linear snapshot burst and line-granular
+  scanout reads are fine, *provided nothing else on the bus is fighting them*.
 - **Size the command ring for the pathological scene, not the average.**
   ~100 cmds/frame was the design estimate; dense 8×8-tile maps emitted >1250
   and overflowed the 1022-entry ring — the failure mode was a latched error

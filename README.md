@@ -16,8 +16,12 @@ pixel.**
 ## Data flow — from source pixels to screen
 
 Three memories, three jobs. The design's central rule, learned the hard way
-(see `docs/lessons-learned.md`): **keep frame pixels off the shared HPS bus
-entirely.**
+(see `docs/lessons-learned.md`): **keep per-pixel composite traffic off the
+shared HPS bus.** The compositor's read-modify-write runs entirely on-chip;
+the only frame pixels that cross the bus are one linear snapshot burst per
+finished frame into the DDR3 scanout double-buffer, plus the reader's
+line-granular bursts back out — sequential traffic the bus handles cheaply,
+unlike the per-pixel RMW that originally killed it.
 
 ```
   ┌──────────────────────────────────────────────────────────────────────┐
@@ -28,7 +32,7 @@ entirely.**
                                    │ commands + one-time atlas uploads
                                    ▼
   ┌──────────────────────────────────────────────────────────────────────┐
-  │  DDR3 (shared f2h bus) — CONTROL traffic only, no frame pixels        │
+  │  DDR3 (shared f2h bus) — control traffic + the scanout FB0/FB1        │
   │   ┌─────────────┐ ┌────────────────┐ ┌────────────┐ ┌──────────────┐  │
   │   │ ctrl block  │ │ command ring   │ │ TL_BUF     │ │ upload heap  │  │
   │   │ 0x3B00_0000 │ │ 512 KiB        │ │ tile-list  │ │ (STAGE       │  │
@@ -48,13 +52,14 @@ entirely.**
   │   (source spans via double-buffered linebuf) │ resident for session │ │
   │        │ composite / RMW                     └──────────────────────┘ │
   │        ▼                                                              │
-  │   on-chip BRAM framebuffer (320×240 RGB565)                           │
-  │     WORK image ──(vblank snapshot)──▶ SCAN image                      │
-  │                                          │                            │
-  └──────────────────────────────────────────┼────────────────────────────┘
-                                             ▼  same-cycle BRAM reads
+  │   on-chip BRAM WORK framebuffer (320×240 RGB565, persistent RMW)      │
+  │     WORK ──(frame-done snapshot burst)──▶ DDR3 FB0/FB1 double-buffer  │
+  │              (fb_ddr_writer; fabric flips fb_bank)   │                │
+  └──────────────────────────────────────────────────────┼────────────────┘
+                                                         ▼ one line-granular
   ┌──────────────────────────────────────────────────────────────────────┐
-  │  scanout reader ──▶ HDMI / analog   (display never waits on a bus)    │
+  │  scanout reader (ddr3_scan_adapter, 80-qword burst per scanline)      │
+  │     ──▶ HDMI / analog                                                 │
   └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -68,11 +73,18 @@ Three architectural decisions define the core:
    header), `SPRITELIST` (Y-sorted sprite batches, per-entry texture +
    palette), and `TILEMAP` (8px cell grids walked by the fabric with
    run-coalescing). The A9's per-frame emit cost is a few dozen commands.
-2. **Framebuffer in on-chip BRAM, snapshot at vblank.** The compositor RMWs a
-   persistent WORK image in M10K and hardware-copies WORK→SCAN at vblank for
-   tear-free scanout. Destination preload/write-back traffic — 44–66 % of
-   compositor cycles when the framebuffer lived in external memory — is gone
-   (FILL ~1.05 cyc/px, COPY ~1.65 in sim), and scanout never touches a bus.
+2. **WORK framebuffer in on-chip BRAM; scanout double-buffer in DDR3.** The
+   compositor RMWs a persistent WORK image in M10K — destination
+   preload/write-back traffic, 44–66 % of compositor cycles when the
+   framebuffer lived in external memory, is gone (FILL ~1.05 cyc/px, COPY
+   ~1.65 in sim). The *scan copy* moved back off-chip in Stage 5 Phase 2
+   (2026-07): at frame-done (immediately — not vblank-gated, which was worth
+   real fps) `fb_ddr_writer` burst-streams WORK to the inactive DDR3
+   framebuffer and the fabric flips `fb_bank`; the reader scans the active
+   buffer with one 80-qword burst per line (`ddr3_scan_adapter`). Same
+   tear-free double-buffer, ~160 M10K freed (the fit dropped from ~89 % BRAM),
+   and the compositing datapath is untouched — only the finished frame ever
+   crosses the bus.
 3. **Sources resident in SDRAM on a dedicated bus.** Atlases are staged
    DDR3→SDRAM by `STAGE` commands once at load (whole-quest residency; a
    permanent, never-freed region) and fetched as spans through a
@@ -137,7 +149,8 @@ command emitters develop against.
 The compositor is **validated end-to-end on real hardware** (DE10-Nano)
 driving the Solarus 1.6.5 engine port (Mystery of Solarus DX, full quest).
 The A9 emits the display list; the fabric composites from SDRAM-resident
-atlases into the BRAM framebuffer; scanout shows correct, tear-free video with
+atlases into the BRAM WORK framebuffer (scanned out from the DDR3
+double-buffer since Stage 5); scanout shows correct, tear-free video with
 `escape=0` — every draw of every frame runs on the fabric, across title,
 overworld, dungeons, dialogs, and scene transitions. A whole quest's atlases
 (~60 MiB) preload into SDRAM at load with an on-screen progress bar.
@@ -189,8 +202,8 @@ libmfgpu/      MFGPU geometry front-end: fixed-point transform/cull turning
                triangle batches into TRILIST display lists — see below
 ```
 
-The **production fabric** (pipelined compositor `comp_pipeline.sv`, BRAM
-framebuffer, SDRAM cache subsystem, tile-list expansion — ~5 800 lines of
+The **production fabric** (pipelined compositor `comp_pipeline.sv`, BRAM WORK
+framebuffer with DDR3 scanout, SDRAM cache subsystem, tile-list expansion — ~5 800 lines of
 SystemVerilog with its own gating testbench suite) is developed in the
 `solarus-mister` integration repo under `fpga/rtl/`, where it can be built into
 a full MiSTer core and validated on hardware. This repo remains the home of
@@ -207,7 +220,8 @@ emitter library that any engine port reuses.
 | v1 RTL spike ↔ model equivalence in sim | ✅ `rtl/` + `sim/` — 17/17 pass |
 | Host command emitter + wire codec + allocators | ✅ `host/` — checks + self-test pass |
 | Pipelined compositor (1 px/clk, all blends native) | ✅ production, in `solarus-mister:fpga/rtl/` |
-| Framebuffer in BRAM + vblank snapshot (tear-free) | ✅ production, HW-validated |
+| WORK framebuffer in BRAM (on-chip RMW, tear-free double-buffer) | ✅ production, HW-validated |
+| Scanout from DDR3 double-buffer (frame-done snapshot, ~160 M10K freed) | ✅ production, HW-validated (Stage 5) |
 | SDRAM-resident whole-quest atlases (128 MB) | ✅ production, HW-validated |
 | Tile-list batch opcodes (static + animated) | ✅ production, HW-validated |
 | Sprite-list batch opcode (`SPRITELIST`, per-entry texture/palette) | ✅ production, HW-validated |
