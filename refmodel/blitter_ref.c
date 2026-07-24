@@ -1,9 +1,10 @@
-/*
- *  blitter_ref.c — software reference model for the MiSTer fabric 2D blitter.
+/* VENDORED-PEER of blitter_ref.h — the C reference model body. Workstream C
+ * (Verification) owns this file for the "v2 blitter escape elimination" effort:
+ * it implements the bit-exact software goldens that the comp_pipeline RTL
+ * (Workstream B) must match, and the command-list executor blt_execute() that
+ * the sim testbenches diff against.
  *
- *  This file implements the bit-exact software goldens that the compositor RTL
- *  must match, and the command-list executor blt_execute() that the sim
- *  testbenches diff against.
+ *  blitter_ref.c — software reference model for the MiSTer fabric 2D blitter.
  *
  *  Pixel model (v1): 320x240 RGB565 framebuffer. v2 adds the "escape
  *  elimination" colour ops so Solarus colour-modulation / additive / multiply
@@ -20,7 +21,47 @@
  *  Copyright (C) 2026 — GPL-3.0 (matches solarus-mister/fpga).
  */
 #include "blitter_ref.h"
+#include "blt_wire.h" /* [PAL8/Task 4b] blt_pal_id/blt_base_off + the sprite entry
+                       * wire layout this model must decode byte-for-byte */
+#include "grid_cell.h" /* [Stage 3b / grid, Phase B1 Task 4] blt_grid_cell_t + its
+                        * bitfield accessors, decoded by blt_ref_tilemap below */
 #include <string.h>  /* memcpy — used by BLT_OP_TILELIST entry fetch */
+#ifdef BLT_REF_COUNT_ISSUES
+#include <limits.h>  /* INT_MIN — sentinel for blt_ref_tilemap_max_right_x    */
+#endif
+
+/* ──────────────────────────────────────────────────────────────────────────
+ *  [Stage 3b / grid, Phase B1 Task 6] Transaction-count instrumentation.
+ *
+ *  OFF by default (this whole block compiles to nothing) so a normal build
+ *  of this TU is byte-for-byte identical to the pre-Task-6 shipping
+ *  reference model. Build with -DBLT_REF_COUNT_ISSUES to turn it on
+ *  (build_test_tilemap.sh does this; no other build script does).
+ *
+ *  blt_ref_issue_count increments once per blit_one() call — the reference
+ *  model's single choke point for "one blit issued", shared by EVERY op that
+ *  ultimately composites a rect: BLT_OP_BLIT, the BLT_OP_TILELIST[_RES] and
+ *  BLT_OP_SPRITELIST per-entry loops, and the grid walk's per-run blits. In
+ *  test_tilemap.c, Path A (the per-tile path) issues exactly one BLT_OP_BLIT
+ *  per placed tile and Path B (the grid walk) issues one blit per coalesced
+ *  run, so snapshotting this counter around each path's blt_execute() call
+ *  gives Path A's count and Path B's count without any duplicated
+ *  bookkeeping between the two paths.
+ *
+ *  blt_ref_tilemap_max_right_x is grid-walk-specific: the high-water mark of
+ *  (dst_x + w) across every blit blt_ref_tilemap issues since it was last
+ *  reset (the caller resets it, e.g. to INT_MIN, before each measurement).
+ *  It exists to make the right-edge run clamp in blt_ref_tilemap (see the
+ *  "work-avoidance optimization" comment below) load-bearing to something
+ *  other than a framebuffer memcmp: Task 5 proved the clamp changes NO
+ *  output pixel (blit_one's own per-pixel clip already discards anything
+ *  past the framebuffer edge), but it DOES change how far right the ISSUED
+ *  blit reaches — exactly what this high-water mark observes.
+ * ────────────────────────────────────────────────────────────────────────── */
+#ifdef BLT_REF_COUNT_ISSUES
+unsigned long blt_ref_issue_count = 0;
+int blt_ref_tilemap_max_right_x = INT_MIN;
+#endif
 
 /* ──────────────────────────────────────────────────────────────────────────
  *  Frozen v2 ABI constants.
@@ -190,15 +231,52 @@ static void put_blend(uint16_t *fb, int dx, int dy,
  *  BLT_OP_TILELIST per-entry loop so the pixel logic stays DRY.
  * ────────────────────────────────────────────────────────────────────────── */
 static void blit_one(uint16_t *fb, const blt_surface_heap_t *heap, const blt_cmd_t *c) {
+#ifdef BLT_REF_COUNT_ISSUES
+    blt_ref_issue_count++;
+#endif
     int hflip = (c->flags & BLT_F_HFLIP) != 0;
     int vflip = (c->flags & BLT_F_VFLIP) != 0;
     int do_mod = (c->flags & BLT_F_COLORMOD) != 0;
     uint8_t cr=c->_pad[0], cg=c->_pad[1], cb=c->_pad[2];
     int palpha = (c->blend_mode == BLT_BLEND_PALPHA) && (c->format == BLT_FMT_ARGB4444);
+    /* [PAL8] 8bpp palette-indexed source: 1 BYTE per pixel, resolved through the
+     * CLUT bank/slot selected by the command's color word. Mirrors comp_pipeline.sv
+     * exactly: clut_rd_addr = {c_pal_id[4:0], index[7:0] + c_base_off}, RGB565 in
+     * bits[15:0], 4-bit alpha in bits[19:16], and the CLUT alpha only overrides the
+     * mixer alpha (and only skips) for PALPHA -- COPY/COLORKEY/ADD/MULTIPLY keep the
+     * ordinary command alpha and never skip on a transparent index. PAL8 also
+     * bypasses colour-mod in v1 (`src_to_mixer_d` picks pal_rgb before cmod_src_d). */
+    int is_pal8 = (c->format == BLT_FMT_PAL8);
+    unsigned pal_bank = blt_pal_id(c->color);
+    unsigned pal_base = blt_base_off(c->color);
     for (int j=0;j<c->h;j++) for (int i=0;i<c->w;i++) {
         int dx=c->dst_x+i, dy=c->dst_y+j;
         if (dx<0||dx>=BLT_FB_WIDTH||dy<0||dy>=BLT_FB_HEIGHT) continue;
         int sx=c->src_x+(hflip?(c->w-1-i):i), sy=c->src_y+(vflip?(c->h-1-j):j);
+        if (is_pal8) {
+            size_t ioff=(size_t)c->src_off+(size_t)sy*c->src_stride+(size_t)sx;
+            uint8_t idx = (heap && heap->base && ioff < heap->size)
+                        ? heap->base[ioff] : 0u;
+            uint32_t slot = (uint32_t)((idx + pal_base) & 0xFFu);
+            uint32_t w32 = 0;
+            if (heap && heap->clut) {
+                const uint8_t *e = heap->clut
+                                 + ((size_t)pal_bank * BLT_CLUT_ENTRIES + slot) * 4u;
+                w32 = (uint32_t)e[0] | ((uint32_t)e[1]<<8)
+                    | ((uint32_t)e[2]<<16) | ((uint32_t)e[3]<<24);
+            }
+            uint16_t prgb = (uint16_t)(w32 & 0xFFFFu);
+            unsigned a4   = (w32 >> 16) & 0xFu;
+            if (c->blend_mode == BLT_BLEND_PALPHA) {
+                if (a4 == 0) continue;                   /* transparent index */
+                unsigned a8 = (a4 << 4) | a4;            /* RTL: {pal_a4,pal_a4} */
+                unsigned di = (unsigned)dy*BLT_FB_WIDTH+(unsigned)dx;
+                fb[di] = blt_blend565(prgb, fb[di], (uint8_t)a8);
+                continue;
+            }
+            put_blend(fb,dx,dy,prgb,prgb,c->blend_mode,c->flags,c->colorkey,c->alpha);
+            continue;
+        }
         size_t boff=(size_t)c->src_off+(size_t)sy*c->src_stride+(size_t)sx*2u;
         uint16_t raw=heap_px16(heap, boff);
         if (palpha) {
@@ -226,6 +304,138 @@ static void blit_one(uint16_t *fb, const blt_surface_heap_t *heap, const blt_cmd
  *  BLT_FB_WIDTH x BLT_FB_HEIGHT per the BLT_TARGET_APPSURF doc comment.
  * ────────────────────────────────────────────────────────────────────────── */
 static uint16_t appsurf[BLT_FB_PIXELS];
+
+/* ──────────────────────────────────────────────────────────────────────────
+ *  [Stage 2] blt_ref_sprite_list — see the doc comment in blitter_ref.h.
+ *  Each entry is decoded byte-wise (not memcpy'd as a struct) so this model
+ *  matches EXACTLY what the RTL's aligned-qword-pair fetch extracts off the
+ *  wire, per blt_wire.h's blt_sprite_entry_t / blt_pack_sprite_entry.
+ * ────────────────────────────────────────────────────────────────────────── */
+void blt_ref_sprite_list(uint16_t *fb, const blt_surface_heap_t *heap,
+                         const blt_cmd_t *header, uint32_t entry_off, int n,
+                         int16_t bias_x, int16_t bias_y)
+{
+    if (!heap || !heap->base) return;
+    for (int i = 0; i < n; i++) {
+        const uint8_t *p = heap->base + entry_off
+                         + (size_t)i * (size_t)BLT_SPRITE_ENTRY_BYTES;
+        uint32_t src_off = (uint32_t)p[0] | ((uint32_t)p[1] << 8)
+                         | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        uint16_t sx = (uint16_t)(p[4]  | (p[5]  << 8));
+        uint16_t sy = (uint16_t)(p[6]  | (p[7]  << 8));
+        uint16_t w  = (uint16_t)(p[8]  | (p[9]  << 8));
+        uint16_t h  = (uint16_t)(p[10] | (p[11] << 8));
+        int16_t  dx = (int16_t) (p[12] | (p[13] << 8));
+        int16_t  dy = (int16_t) (p[14] | (p[15] << 8));
+        /* [Task 4b] bytes 16-17: the PER-ENTRY palette word (pal_id|base_off for
+         * BLT_FMT_PAL8, 0 otherwise). Bytes 18-23 are reserved/padding. */
+        uint16_t col = (uint16_t)(p[16] | (p[17] << 8));
+
+        blt_cmd_t b = *header;            /* inherit shared header params */
+        b.opcode  = BLT_OP_BLIT;
+        b.src_off = src_off;              /* [Stage 2] PER ENTRY, unlike TILELIST */
+        /* Passed through to blit_one exactly as the OP_TILELIST PAL8 path passes
+         * the header colour it inherits via `b = *c` -- the only difference is that
+         * here it is OVERRIDDEN per entry, because Y-sorted sprites come from
+         * sheets with different palettes while a tile layer has exactly one. */
+        b.color   = col;
+        b.src_x = sx; b.src_y = sy; b.w = w; b.h = h;
+        b.dst_x = (int16_t)(dx + bias_x); b.dst_y = (int16_t)(dy + bias_y);
+        blit_one(fb, heap, &b);
+    }
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ *  [Stage 3b / grid, Phase B1 Task 4] blt_ref_tilemap — the golden model for
+ *  BLT_OP_TILEMAP. See the doc comment in blitter_ref.h; B2's RTL tilemap_unit
+ *  must match this walk EXACTLY.
+ * ────────────────────────────────────────────────────────────────────────── */
+void blt_ref_tilemap(uint16_t *fb, const blt_surface_heap_t *heap,
+                     const blt_cmd_t *header, uint32_t cells_off,
+                     uint16_t grid_w, uint16_t grid_h,
+                     int16_t bias_x, int16_t bias_y)
+{
+    if (!heap || !heap->grid) return;
+    if (grid_w == 0 || grid_h == 0) return;
+
+    /* Visible cell window = intersect the biased grid with the framebuffer,
+     * in PIXEL space first, then converted back to cell indices. A grid that
+     * is fully off-screen on either axis has an empty pixel window -> cull
+     * the WHOLE op here, before any cell is read or any blit is issued (this
+     * is what makes bias=(-16,0) on a 16px-wide grid cull entirely instead of
+     * emitting a blit at a negative destination). */
+    int grid_px_w = (int)grid_w * 8;
+    int grid_px_h = (int)grid_h * 8;
+    int vis_lo_x = bias_x > 0 ? bias_x : 0;
+    int vis_hi_x = (bias_x + grid_px_w) < BLT_FB_WIDTH  ? (bias_x + grid_px_w) : BLT_FB_WIDTH;
+    int vis_lo_y = bias_y > 0 ? bias_y : 0;
+    int vis_hi_y = (bias_y + grid_px_h) < BLT_FB_HEIGHT ? (bias_y + grid_px_h) : BLT_FB_HEIGHT;
+    if (vis_lo_x >= vis_hi_x || vis_lo_y >= vis_hi_y) return;   /* nothing visible: cull */
+
+    /* Pixel bounds -> cell-index bounds. vis_lo_x/y >= bias_x/y always (they
+     * are a max() against 0), so these numerators are non-negative — plain
+     * truncating division is floor here, no negative-division pitfalls. */
+    int cx0 = (vis_lo_x - bias_x) / 8;
+    int cx1 = (vis_hi_x - bias_x + 7) / 8;      /* ceil */
+    int cy0 = (vis_lo_y - bias_y) / 8;
+    int cy1 = (vis_hi_y - bias_y + 7) / 8;      /* ceil */
+    if (cx1 > grid_w) cx1 = grid_w;
+    if (cy1 > grid_h) cy1 = grid_h;
+
+    for (int cy = cy0; cy < cy1; cy++) {
+        int cx = cx0;
+        while (cx < cx1) {
+            size_t cell_idx = (size_t)cy * (size_t)grid_w + (size_t)cx;
+            blt_grid_cell_t cell;
+            memcpy(&cell, heap->grid + (size_t)cells_off + cell_idx * sizeof(blt_grid_cell_t),
+                   sizeof cell);
+
+            if (blt_grid_cell_is_empty(cell)) { cx += 1; continue; }
+
+            int run = blt_grid_cell_run(cell);
+            if (cx + run > cx1) run = cx1 - cx;   /* clamp: work-avoidance optimization (blit_one's per-pixel clip discards off-screen pixels, so this only avoids wasted bandwidth) -- pixel-invisible (Task 5) but issue-count-visible (Task 6's blt_ref_tilemap_max_right_x), see the block comment above */
+
+            uint16_t pid   = blt_grid_cell_pid(cell);
+            uint8_t  sub_x = blt_grid_cell_sub_x(cell);
+            uint8_t  sub_y = blt_grid_cell_sub_y(cell);
+
+            /* Resolve the pattern's source rect — the SAME per-pattern table
+             * BLT_OP_TILELIST_RES uses: FRT[pid*BLT_MAXF + CFT[pid]]. */
+            uint16_t frame = 0;
+            if (heap->cft) memcpy(&frame, heap->cft + (size_t)pid * 2u, sizeof frame);
+            blt_frame_rect_t r = {0,0,0,0};
+            if (heap->frt)
+                memcpy(&r, heap->frt + ((size_t)pid * BLT_MAXF + frame) * sizeof(blt_frame_rect_t),
+                       sizeof r);
+
+            blt_cmd_t b = *header;                 /* inherit shared params */
+            b.opcode = BLT_OP_BLIT;
+            b.src_x  = (uint16_t)(r.src_x + (uint16_t)(sub_x * 8u));
+            b.src_y  = (uint16_t)(r.src_y + (uint16_t)(sub_y * 8u));
+            b.w      = (uint16_t)(run * 8);
+            b.h      = 8;
+            /* #24 OOB rule: dst is computed in a plain (wide, signed) int,
+             * THEN cast to the command's signed int16_t field. blit_one /
+             * put_blend clip against the framebuffer while dx/dy are still
+             * signed ints — strictly BEFORE either is cast to an unsigned
+             * pixel index — so a negative dst here clips; it can never wrap
+             * into a huge unsigned coordinate. */
+            int dst_x = cx * 8 + bias_x;
+            int dst_y = cy * 8 + bias_y;
+            b.dst_x  = (int16_t)dst_x;
+            b.dst_y  = (int16_t)dst_y;
+
+#ifdef BLT_REF_COUNT_ISSUES
+            {
+                int right_x = (int)b.dst_x + (int)b.w;
+                if (right_x > blt_ref_tilemap_max_right_x) blt_ref_tilemap_max_right_x = right_x;
+            }
+#endif
+            blit_one(fb, heap, &b);
+            cx += run;
+        }
+    }
+}
 
 /* ──────────────────────────────────────────────────────────────────────────
  *  blt_execute — walk the command list against a 320x240 RGB565 framebuffer.
@@ -342,6 +552,35 @@ int blt_execute(uint16_t *fb,
             }
             continue;
         }
+
+        if (c->opcode == BLT_OP_SPRITELIST) {
+            /* [Stage 2] SAME header packing as BLT_OP_TILELIST: N in w|h<<16, the
+             * entry-array byte offset (into THIS heap) in dst_x|dst_y<<16, and a
+             * signed per-batch dst bias in src_x/src_y. Unlike a tile batch, each
+             * entry carries its OWN src_off (decoded inside blt_ref_sprite_list). */
+            uint32_t n = (uint32_t)c->w | ((uint32_t)c->h << 16);
+            uint32_t eoff = (uint32_t)(uint16_t)c->dst_x | ((uint32_t)(uint16_t)c->dst_y << 16);
+            int16_t bias_x = (int16_t)c->src_x;
+            int16_t bias_y = (int16_t)c->src_y;
+            blt_ref_sprite_list(fb, heap, c, eoff, (int)n, bias_x, bias_y);
+            continue;
+        }
+
+        if (c->opcode == BLT_OP_TILEMAP) {
+            /* [Stage 3b / grid] SAME header packing as BLT_OP_TILELIST/_RES/
+             * SPRITELIST for src_off/src_stride/blend/format/flags and the
+             * signed per-batch dst bias in src_x/src_y — but w|h<<16 and
+             * dst_x|dst_y<<16 are OVERLOADED differently here (grid dims IN
+             * CELLS, and the cell array's byte offset in GRID_BUF, NOT an
+             * entry count / entry-array offset); see the opcode's doc
+             * comment in blitter_ref.h. */
+            uint16_t grid_w = c->w, grid_h = c->h;
+            uint32_t cells_off = (uint32_t)(uint16_t)c->dst_x | ((uint32_t)(uint16_t)c->dst_y << 16);
+            int16_t bias_x = (int16_t)c->src_x;
+            int16_t bias_y = (int16_t)c->src_y;
+            blt_ref_tilemap(fb, heap, c, cells_off, grid_w, grid_h, bias_x, bias_y);
+            continue;
+        }
         /* unknown opcode: ignore (model safety) */
     }
     return executed;
@@ -383,7 +622,7 @@ static void test_tilelist_equals_n_blits(void) {
         {16,16, 8,8, -4,50}, {0,0, 8,8, 315,200} /* partial offscreen */
     };
     memcpy(heap+entry_off, ents, sizeof ents);
-    blt_surface_heap_t h = { heap, sizeof heap, 0, 0 };
+    blt_surface_heap_t h = { .base = heap, .size = sizeof heap };
 
     /* A: one TILELIST */
     memset(fb_a, 0, sizeof fb_a);
@@ -449,7 +688,8 @@ static void test_tilelist_res_equals_n_blits(void) {
         {0, -4,50, 0}, {2, 315,200, 0}
     };
     memcpy(heap+entry_off, ents, sizeof ents);
-    blt_surface_heap_t h = { heap, sizeof heap, (const uint8_t*)frt, (const uint8_t*)cft };
+    blt_surface_heap_t h = { .base = heap, .size = sizeof heap,
+                             .frt = (const uint8_t*)frt, .cft = (const uint8_t*)cft };
 
     /* A: one TILELIST_RES (preceded by a no-op FRT_UPLOAD, like the fabric). */
     memset(fb_a, 0, sizeof fb_a);
@@ -538,7 +778,7 @@ int main(void) {
         uint16_t srcpix = 0xFFFF;                 /* white source */
         uint8_t heapbuf[8];
         heapbuf[0] = srcpix & 0xFF; heapbuf[1] = srcpix >> 8;
-        blt_surface_heap_t heap = { heapbuf, sizeof(heapbuf), 0, 0 };
+        blt_surface_heap_t heap = { .base = heapbuf, .size = sizeof(heapbuf) };
         blt_cmd_t cmds[2];
         memset(cmds, 0, sizeof(cmds));
         cmds[0].opcode = BLT_OP_BLIT; cmds[0].blend_mode = BLT_BLEND_COPY;

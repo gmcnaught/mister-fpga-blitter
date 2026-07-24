@@ -29,7 +29,7 @@ static uint16_t *run_ring(const uint8_t *ring, int ncmds, const uint8_t *src, si
     blt_cmd_t cmds[128];
     int n = ncmds > 128 ? 128 : ncmds;
     for (int i=0;i<n;i++) blt_unpack_cmd(ring + (size_t)i*BLT_CMD_BYTES, &cmds[i]);
-    blt_surface_heap_t h = { src, srclen, 0, 0 };
+    blt_surface_heap_t h = { .base = src, .size = srclen };
     blt_execute(fb, &h, cmds, n);
     return fb;
 }

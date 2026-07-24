@@ -70,8 +70,14 @@ The `0x3A000000` region keeps the existing video/joystick/audio contract.
 | `0x3B000040` | **512 KiB** | command ring: ~16 382 × 32 B, walk-until-END        |
 | `0x3B080000` | ~15.2 MiB | texture upload heap (staging source for `STAGE`)      |
 | `0x3BF40000` | 512 KiB   | `TL_BUF` — tile-list entry buffer (§5)                |
-| `0x3BFC0000` | 8 KiB     | `FRT` — frame-rect table (`TILELIST_RES`, §5)         |
-| `0x3BFC2000` | 256 B     | `CFT` — current-frame table (`TILELIST_RES`, §5)      |
+| `0x3BFC2000` | 512 B     | `CFT` — current-frame table (`TILELIST_RES`, §5); u16 × `BLT_MAXP`=256 |
+| `0x3BFC3000` | 64 KiB    | `CLUT_BUF` — CLUT upload DMA source (`CLUT_UPLOAD`, §5): 32 banks × 256 entries, one 32-bit entry per qword |
+| `0x3BFD3000` | 128 KiB   | `SP_BUF` — sprite-entry buffer (`SPRITELIST`, §5): 24 B/entry, ~5 461 sprites/frame |
+| `0x3BFF3000` | 2 MiB     | `GRID_BUF` — grid-cell arrays (`TILEMAP`, §5): 4 B/cell, own read region (not the source heap) |
+| `0x3C1F3000` | 16 KiB    | `FRT` — frame-rect table (`TILELIST_RES`, §5); relocated above `GRID_BUF` when `BLT_MAXP` widened 128→256 (was `0x3BFC0000`) |
+
+The region end grew `0x3C000000` → `0x3C200000` (18 MiB total) for `GRID_BUF`
++ the relocated `FRT` — still inside the kernel's `memmap` reservation.
 
 **Ring-size lesson (v1 → v2):** the ring shipped at 32 KiB (1022 commands) and
 was believed generous at ~100 cmds/frame. Dense 8×8-tile maps emit **>1250
@@ -138,21 +144,28 @@ RGB888 **color-mod tint** when `flags.COLORMOD` is set — an ABI-compatible
 extension (zero-filled commands behave exactly as v1).
 
 **opcode:**
-`0 NOP · 1 END · 2 FILL · 3 BLIT · 4 STAGE · 5 TILELIST · 6 TILELIST_RES · 7 FRT_UPLOAD`
+`0 NOP · 1 END · 2 FILL · 3 BLIT · 4 STAGE · 5 TILELIST · 6 TILELIST_RES · 7 FRT_UPLOAD ·
+8 (reserved — retired BGPLANE_WRITE, held for deployed-bitstream stability) ·
+9 CLUT_UPLOAD · 10 SPRITELIST · 11 TILEMAP · 12 TRILIST · 13 SET_TARGET`
 
 **blend_mode:**
 `0 COPY · 1 COLORKEY · 2 CONST_ALPHA · 3 PALPHA (ARGB4444 src, per-pixel alpha) · 4 ADD (saturating) · 5 MULTIPLY`
 ADD/MULTIPLY also apply to `FILL` (src channel = `color` channel).
 
-**format:** `0 RGB565 · 1 ARGB4444` (`{A4,R4,G4,B4}`, A in [15:12]; required
-for PALPHA — A4==0 pixels are skip-write).
+**format:** `0 RGB565 · 1 ARGB4444 · 2 PAL8` (ARGB4444 = `{A4,R4,G4,B4}`, A in
+[15:12]; required for PALPHA — A4==0 pixels are skip-write. PAL8 = 8bpp
+palette-indexed: `color` carries `pal_id[12:8] | base_off[7:0]` — see
+`blt_pal_color` in `blt_wire.h` — resolved through the on-chip CLUT).
 
 **flags:**
 `0x01 HFLIP · 0x02 VFLIP · 0x04 COLORKEY (also key a CONST_ALPHA blit) ·
 0x08 STAGE_DST (STAGE: u32[2] carries the SDRAM dest offset) ·
 0x10 SRC_SDRAM (per-command source mux: read this source from SDRAM) ·
 0x20 SRC_FB (source is a compositor-written FB; fires the coherency barrier) ·
-0x40 COLORMOD (tint bytes valid)`
+0x40 COLORMOD (tint bytes valid) ·
+0x80 per-opcode SHARED: BGCOV (reserved, retired bake-coverage bit, tile/blit
+family) / SRC_SURFACE (TRILIST only: sample the app-surface render target
+instead of the texture page — the two never meet on the wire)`
 
 **Per-command source mux lesson:** v1's follow-on made "read sources from
 SDRAM" a single global control bit; real frames mix staged and unstaged
@@ -212,14 +225,52 @@ Same header packing, but each entry is 8 bytes
 each tile's source rect as `FRT[pattern_id][CFT[pattern_id]]`:
 
 - **FRT** (frame-rect table): per-pattern, per-frame source rects
-  (`BLT_MAXP=128` patterns × `BLT_MAXF=8` frames, 8 B each), uploaded once per
-  scene via `FRT_UPLOAD` (header `w | h<<16` = qword count) into fabric BRAM.
+  (`BLT_MAXP=256` patterns × `BLT_MAXF=8` frames, 8 B each — widened from 128
+  for grid pattern tables), uploaded once per scene via `FRT_UPLOAD` (header
+  `w | h<<16` = qword count) into fabric BRAM.
 - **CFT** (current-frame table): one u16 per pattern; the A9 writes the
   animation frame index each frame — that write is the *entire* per-frame
   animated-tile cost.
 
 Combined effect on hardware: a dense map that emitted ~3 758 per-tile commands
 per frame collapsed to ~1–3 header commands per layer.
+
+### `CLUT_UPLOAD` (9) — palette table upload (PAL8 sources)
+Streams the whole CLUT (32 banks × 256 entries, one 32-bit entry per qword —
+`bits[15:0]` RGB565, `bits[19:16]` 4-bit alpha) from the fixed `CLUT_BUF` DDR
+region into fabric BRAM. Header `w | h<<16` = qword count; no framebuffer
+effect. With `format=PAL8`, sources halve to 8bpp and the command's `color`
+field selects `pal_id`/`base_off` (`blt_pal_color`). Per-bank partial upload
+is a possible future optimization; v1 uploads the full table.
+
+### `SPRITELIST` (10) — ordered camera-surface sprite batch
+Same header packing as `TILELIST`, but each entry is **24 bytes** (three
+aligned qwords, `blt_sprite_entry_t` in `blt_wire.h`) carrying its **own**
+`src_off` and its **own** PAL8 palette word — Y-sorted sprites come from many
+sheets, so neither is header-shareable the way a single-tileset layer's are.
+Entries composite in array order: Z-order == emission order.
+
+### `TILEMAP` (11) — per-layer 8px cell grid walk
+The header points (`dst_x | dst_y<<16` = byte offset into `GRID_BUF`, its own
+DDR region) at a flat `grid_w × grid_h` array of 32-bit cells
+(`blt_grid_cell_t`, `grid_cell.h`) — **every** cell present including empty
+ones; `w | h<<16` = the grid dimensions **in cells**, not pixels or an entry
+count. The fabric walks only the on-screen cell window, issuing one blit per
+contiguous non-empty run (run lengths pre-coalesced by `grid_build.h`),
+resolving each cell's source rect through the same `FRT[pid][CFT[pid]]`
+tables `TILELIST_RES` uses, offset by the cell's `sub_x/sub_y`. Host-side
+builders: `grid_build.h` (cell encoding + run coalescing), `grid_alloc.h`
+(GRID_BUF bump allocator), `grid_decompose.h` (stack-height overlap
+layering); `test_grid_walk_equiv` gates grid-walk ≡ per-tile-blits.
+
+### `TRILIST` (12) + `SET_TARGET` (13) — MFGPU geometry front-end
+Developed in this repo (`libmfgpu/`, `refmodel/blt_tri.c`, `rtl/blt_tri.sv`),
+not yet in the deployed solarus fabric. `TRILIST` rasterizes textured-triangle
+lists (vertices are 16-byte `blt_vtx_t` triples in a separate vertex buffer);
+`SET_TARGET` switches compositing between the WORK framebuffer and the
+app-surface render target (`cmd.color[1:0]`), which `TRILIST` can sample via
+`flags.SRC_SURFACE`. Renumbered 10→12 / 11→13 when `SPRITELIST`/`TILEMAP`
+shipped on hardware with 10/11.
 
 ## 6. Why this format / source-pixel decisions (unchanged rationale)
 
@@ -235,15 +286,20 @@ per frame collapsed to ~1–3 header commands per layer.
 
 Everything host-side builds and runs with no hardware and no deps:
 
-- `../refmodel/ make test` — 28 contract checks + the embedded self-test
-  (`-DBLT_REF_SELFTEST`: exhaustive divide-free-reduction proofs, COLORMOD /
-  ADD / MULTIPLY goldens, TILELIST ≡ N-blits equivalence).
-- `../host/ make test` — 22 emitter/codec checks + the embedded self-test
-  (STAGE, SDRAM staging + permanent-region allocators, tile-list emit paths).
+- `../refmodel/ make test` — 34 contract checks + the TRILIST rasterizer
+  goldens + the embedded self-test (`-DBLT_REF_SELFTEST`: exhaustive
+  divide-free-reduction proofs, COLORMOD / ADD / MULTIPLY goldens,
+  TILELIST ≡ N-blits equivalence, PAL8/CLUT goldens).
+- `../host/ make test` — 28 emitter/codec checks, the embedded self-test
+  (STAGE, SDRAM staging + permanent-region allocators, tile/grid/CLUT/PAL8
+  emit paths, src-domain mux guards), the GRID_BUF allocator test, and the
+  grid-walk ≡ per-tile-blits equivalence gate.
+- `../libmfgpu/ make test` — transform/cull → TRILIST display-list end-to-end.
 - `../sim/ make test` — the v1 RTL spike diffed qword-for-qword against the
-  reference model (11 scenarios). The production fabric in `solarus-mister`
-  carries its own gating testbenches (`tb_blitter_*`) that hold each pipeline
-  stage bit-exact to the same golden model.
+  reference model (17 scenarios incl. the TRILIST rasterizer). The production
+  fabric in `solarus-mister` carries its own gating testbenches
+  (`tb_blitter_*`) that hold each pipeline stage bit-exact to the same golden
+  model.
 
 The bit-exact-golden discipline is the single most-repaid decision in the
 project: every fabric rewrite (per-pixel FSM → pipelined compositor → BRAM

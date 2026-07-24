@@ -1,3 +1,4 @@
+/* VENDORED from github.com/gmcnaught/mister-fpga-blitter (host/blt_emitter.c) — do not edit here; edit upstream + re-copy. */
 /*
  *  blt_emitter.c — engine-agnostic blit display-list emitter. See blt_emitter.h.
  *  GPL-3.0.
@@ -33,6 +34,18 @@ static blt_surface_ref_t upload16(blt_emitter_t *e, const uint16_t *pixels,
                                   int w, int h, int pitch, uint8_t format)
 {
     blt_surface_ref_t r = (blt_surface_ref_t){0};
+    /* [MiSTer #109] Reject geometry that will not fit the 16-bit wire fields.
+     * blt_surface_ref_t.stride/w/h are uint16_t and the command's src_stride/w/h
+     * are 16-bit, so a surface wider than 32767px (stride = w*2 > 0xFFFF) or a
+     * dimension > 65535 would silently truncate/wrap and blit garbage with no
+     * diagnostic. Set overflow (same escape contract as heap exhaustion, line
+     * below) and return an invalid ref instead of truncating. */
+    if (w < 0 || h < 0 ||
+        (size_t)w > 0xFFFFu || (size_t)h > 0xFFFFu ||
+        (size_t)w * 2u > 0xFFFFu) {
+        e->overflow = 1;
+        return r;
+    }
     size_t stride = (size_t)w * 2;
     size_t need = (size_t)h * stride;
     /* [MiSTer #14] allocate from the free-list (was a bump pointer). blt_alloc keeps
@@ -72,7 +85,11 @@ void blt_begin_frame(blt_emitter_t *e, int target_buf, int clear,
     e->cmd_count   = 0;
     e->tl_used     = 0;        /* reset tile-list entry buffer cursor */
     e->vtx_used    = 0;        /* reset TRILIST vertex buffer cursor */
+    e->sp_used     = 0;        /* [Task 3] reset sprite-entry buffer cursor */
+    e->grid_used   = 0;        /* [Stage 3b grid] reset GRID_BUF cursor */
     e->overflow    = 0;        /* fresh per-frame overflow flag */
+    e->dropped     = 0;        /* fresh per-frame drop counter */
+    e->src_domain_fault = 0;   /* [#33/#34] fresh per-frame wrong-domain source tripwire */
     /* target_buf: 0/1 = the two display framebuffers; 2 = the OFF-SCREEN bg-cache
      * compose region (issue #18). Must NOT collapse 2 -> 1: the old `?1:0` clamped
      * the cache pass onto FB1, so the fabric never routed the blit to CACHE_QW (the
@@ -86,16 +103,67 @@ void blt_begin_frame(blt_emitter_t *e, int target_buf, int clear,
 static int emit(blt_emitter_t *e, const blt_cmd_t *c)
 {
     size_t pos = (size_t)e->cmd_count * BLT_CMD_BYTES;
-    if (pos + BLT_CMD_BYTES > e->ring_cap) { e->overflow = 1; return -1; }
+    if (pos + BLT_CMD_BYTES > e->ring_cap) { e->overflow = 1; e->dropped++; return -1; }
     blt_pack_cmd(c, e->ring + pos);
     e->cmd_count++;
     return 0;
+}
+
+/* [#33/#34 src-domain] THE single source of truth for the SDRAM-vs-DDR3 source mux.
+ * Source atlases are staged whole-quest into SDRAM (#66) and the fabric reads render
+ * source through the SDRAM P_SRC path, so a resident (staged) ref must be read from
+ * its sdram_off; an unstaged ref (or sdram_src mode off) falls back to the DDR3 heap
+ * .off. Every source-PIXEL-reading emitter MUST resolve its offset through here rather
+ * than open-coding it — the PR #142 grid-emitter garbage was exactly one emitter
+ * open-coding `src_off = tex.off` and diverging from this rule. Pure/read-only: returns
+ * the resolved byte offset and, via *use_sdram, whether the caller must set
+ * BLT_F_SRC_SDRAM (the flag is per-command — a staged and an unstaged source cannot be
+ * read by one command — and is load-bearing for sprite run-key grouping even though the
+ * current fabric hardwires SDRAM source). */
+uint32_t blt_src_off(const blt_emitter_t *e, blt_surface_ref_t ref, int *use_sdram)
+{
+    int sd = (e->sdram_src && ref.sdram_off != BLT_ALLOC_FAIL);
+    if (use_sdram) *use_sdram = sd;
+    return sd ? ref.sdram_off : ref.off;
+}
+
+/* [#33/#34 src-domain] Apply the mux to a command: set c->src_off and, when the source
+ * resolves to SDRAM, OR BLT_F_SRC_SDRAM into c->flags. The one call every source-pixel
+ * command emitter uses so the offset/flag pair can never diverge per opcode again. */
+static void blt_cmd_apply_src(blt_emitter_t *e, blt_surface_ref_t ref, blt_cmd_t *c)
+{
+    int use_sdram;
+    c->src_off = blt_src_off(e, ref, &use_sdram);
+    if (use_sdram) c->flags |= BLT_F_SRC_SDRAM;
+    else if (e->sdram_src) e->src_domain_fault++;   /* [#33/#34] poison: DDR3 offset under
+                                                     * SDRAM-source fabric -> garbage. See
+                                                     * src_domain_fault's doc in the header. */
 }
 
 int blt_fill(blt_emitter_t *e, int x, int y, int w, int h, uint16_t color)
 {
     blt_cmd_t c; memset(&c, 0, sizeof(c));
     c.opcode = BLT_OP_FILL;
+    c.dst_x = (int16_t)x; c.dst_y = (int16_t)y;
+    c.w = (uint16_t)w; c.h = (uint16_t)h; c.color = color;
+    return emit(e, &c);
+}
+
+/* Same as blt_fill, but carries an explicit BLT_F_* flags byte. blt_fill above
+ * is unchanged (flags always 0).
+ *
+ * RETAINED (Stage 3b): originally added for the ARGB4444 plane bake
+ * (BLT_F_BGCOV cleared the bake-coverage tracker instead of setting it — see
+ * bgplane_coverage.sv). The bake was deleted host-side in Stage 3b Phase A
+ * and BLT_F_BGCOV is now RESERVED/unused (see blitter_ref.h), so this
+ * function is currently callerless. Kept deliberately as a generic
+ * flags-parameterized fill on the emitter API — do not delete it. */
+int blt_fill_flags(blt_emitter_t *e, int x, int y, int w, int h, uint16_t color,
+                   uint8_t flags)
+{
+    blt_cmd_t c; memset(&c, 0, sizeof(c));
+    c.opcode = BLT_OP_FILL;
+    c.flags = flags;
     c.dst_x = (int16_t)x; c.dst_y = (int16_t)y;
     c.w = (uint16_t)w; c.h = (uint16_t)h; c.color = color;
     return emit(e, &c);
@@ -109,17 +177,12 @@ int blt_blit(blt_emitter_t *e, blt_surface_ref_t s,
     blt_cmd_t c; memset(&c, 0, sizeof(c));
     c.opcode = BLT_OP_BLIT; c.blend_mode = blend; c.flags = flags;
     c.format = s.format;            /* RGB565 or ARGB4444, per the upload */
-    /* [MiSTer #33/#34] in SDRAM-VRAM mode a STAGED source is read from its SDRAM
-     * offset; an un-staged source stays on DDR3. C_SRCSEL is only the frame-level
-     * master enable, so tag THIS command with F_SRC_SDRAM (per-command mux, #34) —
-     * else under global C_SRCSEL=1 the fabric would read un-staged DDR3 offsets out
-     * of SDRAM (garbage/black). FILLs never reach here; framebuffer-carry blits use
-     * un-staged handles -> no flag -> DDR3. */
-    {
-        int use_sdram = (e->sdram_src && s.sdram_off != BLT_ALLOC_FAIL);
-        c.src_off = use_sdram ? s.sdram_off : s.off;
-        if (use_sdram) c.flags |= BLT_F_SRC_SDRAM;
-    }
+    /* [MiSTer #33/#34] SDRAM-vs-DDR3 source mux — see blt_cmd_apply_src. A STAGED
+     * source is read from its SDRAM offset (flag set); an un-staged one falls back to
+     * the DDR3 heap .off. NOTE the current fabric hardwires SDRAM source, so the DDR3
+     * fallback is a believed-dead path tracked by e->src_domain_fault (blt_cmd_apply_src).
+     * FILLs never reach here. */
+    blt_cmd_apply_src(e, s, &c);
     c.src_stride = s.stride;
     c.src_x = (uint16_t)sx; c.src_y = (uint16_t)sy;
     c.w = (uint16_t)w; c.h = (uint16_t)h;
@@ -131,6 +194,28 @@ int blt_blit(blt_emitter_t *e, blt_surface_ref_t s,
 int blt_blit_copy(blt_emitter_t *e, blt_surface_ref_t s, int dx, int dy)
 {
     return blt_blit(e, s, 0, 0, s.w, s.h, dx, dy, BLT_BLEND_COPY, 0, 0, 0);
+}
+
+/* [PAL8 v1] blt_blit, but format is forced to BLT_FMT_PAL8 and the command's
+ * color field carries pal_id/base_off (blt_blit has no color parameter to do
+ * this through). */
+int blt_blit_pal8(blt_emitter_t *e, blt_surface_ref_t s,
+                  int sx, int sy, int w, int h, int dx, int dy,
+                  uint8_t blend, uint16_t key, uint8_t alpha, uint8_t flags,
+                  uint8_t pal_id, uint8_t base_off)
+{
+    if (!s.valid) { e->overflow = 1; return -1; }
+    blt_cmd_t c; memset(&c, 0, sizeof(c));
+    c.opcode = BLT_OP_BLIT; c.blend_mode = blend; c.flags = flags;
+    c.format = BLT_FMT_PAL8;        /* [PAL8 v1] 8bpp palette-indexed source */
+    blt_cmd_apply_src(e, s, &c);    /* [MiSTer #33/#34] SDRAM vs DDR3 source mux */
+    c.src_stride = s.stride;
+    c.src_x = (uint16_t)sx; c.src_y = (uint16_t)sy;
+    c.w = (uint16_t)w; c.h = (uint16_t)h;
+    c.dst_x = (int16_t)dx; c.dst_y = (int16_t)dy;
+    c.colorkey = key; c.alpha = alpha;
+    c.color = blt_pal_color(pal_id, base_off);   /* [PAL8 v1] pal_id[11:8] | base_off[7:0] */
+    return emit(e, &c);
 }
 
 /* [v2] Color-modulated blit: packs cr,cg,cb into _pad[0..2] and sets
@@ -145,12 +230,7 @@ int blt_blit_mod(blt_emitter_t *e, blt_surface_ref_t s,
     c.opcode = BLT_OP_BLIT; c.blend_mode = blend;
     c.flags = flags | BLT_F_COLORMOD;   /* always set COLORMOD */
     c.format = s.format;
-    /* [MiSTer #33/#34] same SDRAM vs DDR3 source mux as blt_blit */
-    {
-        int use_sdram = (e->sdram_src && s.sdram_off != BLT_ALLOC_FAIL);
-        c.src_off = use_sdram ? s.sdram_off : s.off;
-        if (use_sdram) c.flags |= BLT_F_SRC_SDRAM;
-    }
+    blt_cmd_apply_src(e, s, &c);    /* [MiSTer #33/#34] SDRAM vs DDR3 source mux */
     c.src_stride = s.stride;
     c.src_x = (uint16_t)sx; c.src_y = (uint16_t)sy;
     c.w = (uint16_t)w; c.h = (uint16_t)h;
@@ -298,19 +378,16 @@ void blt_tile_list_init(blt_emitter_t *e, void *tl_buf, size_t tl_cap)
  * texture-bounds fields, unused by the fabric — confirmed safe to repurpose). */
 static int tl_emit_header(blt_emitter_t *e, uint8_t opcode, blt_surface_ref_t tex,
                           uint8_t blend, uint16_t key, uint8_t alpha, uint8_t flags,
-                          uint32_t eoff, int n, int16_t bias_x, int16_t bias_y)
+                          uint32_t eoff, int n, int16_t bias_x, int16_t bias_y,
+                          uint16_t color)
 {
     blt_cmd_t c; memset(&c, 0, sizeof(c));
     c.opcode     = opcode;
     c.blend_mode = blend;
     c.flags      = flags;
     c.format     = tex.format;
-    /* [#33/#34] same SDRAM vs DDR3 source mux as blt_blit */
-    {
-        int use_sdram = (e->sdram_src && tex.sdram_off != BLT_ALLOC_FAIL);
-        c.src_off = use_sdram ? tex.sdram_off : tex.off;
-        if (use_sdram) c.flags |= BLT_F_SRC_SDRAM;
-    }
+    c.color      = color;   /* [PAL8] pal_id/base_off for BLT_FMT_PAL8 tilesets; 0 otherwise */
+    blt_cmd_apply_src(e, tex, &c);   /* [#33/#34] SDRAM vs DDR3 source mux */
     c.src_stride = tex.stride;
     c.src_x      = (uint16_t)bias_x;                           /* [#52] signed dst bias x */
     c.src_y      = (uint16_t)bias_y;                           /* [#52] signed dst bias y */
@@ -325,20 +402,130 @@ static int tl_emit_header(blt_emitter_t *e, uint8_t opcode, blt_surface_ref_t te
 
 int blt_tile_list_res(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
                       uint16_t key, uint8_t alpha, uint8_t flags,
-                      uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y)
+                      uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y,
+                      uint16_t color)
 {
     if (!tex.valid || n <= 0) { e->overflow = 1; return -1; }
     return tl_emit_header(e, BLT_OP_TILELIST_RES, tex, blend, key, alpha, flags,
-                          entry_off, n, bias_x, bias_y);
+                          entry_off, n, bias_x, bias_y, color);
 }
 
 int blt_tile_list_static(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
                          uint16_t key, uint8_t alpha, uint8_t flags,
-                         uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y)
+                         uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y,
+                         uint16_t color)
 {
     if (!tex.valid || n <= 0) { e->overflow = 1; return -1; }
     return tl_emit_header(e, BLT_OP_TILELIST, tex, blend, key, alpha, flags,
-                          entry_off, n, bias_x, bias_y);
+                          entry_off, n, bias_x, bias_y, color);
+}
+
+/* ─── [Task 3 / Stage 2] blt_sprite_list_init / blt_sprite_list ─────────── */
+
+void blt_sprite_list_init(blt_emitter_t *e, void *sp_buf, size_t sp_cap)
+{
+    e->sp_buf  = (uint8_t *)sp_buf;
+    e->sp_cap  = sp_cap;
+    e->sp_used = 0;
+}
+
+/* Header-only BLT_OP_SPRITELIST -- SAME header packing as BLT_OP_TILELIST
+ * (see tl_emit_header above): w|h<<16 = entry count, dst_x|dst_y<<16 =
+ * entry-array byte offset, src_x/src_y = signed per-batch dst bias. Unlike
+ * blt_tile_list_static/res there is no shared texture handle to pull
+ * src_off/src_stride/format from -- each sprite entry carries its own
+ * src_off, so the caller passes src_stride/format directly. */
+int blt_sprite_list(blt_emitter_t *e, uint32_t src_stride, uint8_t format, uint8_t blend,
+                    uint16_t key, uint8_t alpha, uint8_t flags,
+                    uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y)
+{
+    blt_cmd_t c;
+    memset(&c, 0, sizeof c);
+    c.opcode     = BLT_OP_SPRITELIST;
+    c.blend_mode = blend;
+    c.format     = format;
+    c.flags      = flags;
+    c.alpha      = alpha;
+    c.colorkey   = key;
+    c.src_stride = (uint16_t)src_stride;
+    c.src_x      = (uint16_t)bias_x;              /* header bias slots, per convention */
+    c.src_y      = (uint16_t)bias_y;
+    c.w          = (uint16_t)((unsigned)n & 0xFFFF);        /* w | h<<16 = entry count    */
+    c.h          = (uint16_t)((unsigned)n >> 16);
+    c.dst_x      = (int16_t)(entry_off & 0xFFFF); /* dst_x | dst_y<<16 = entry offset */
+    c.dst_y      = (int16_t)(entry_off >> 16);
+    return emit(e, &c);
+}
+
+/* ─── [Task 4 / Stage 2] bounded ordered sprite channel ─────────────────── */
+
+void blt_sprite_channel_init(blt_sprite_channel_t *ch, blt_emitter_t *e, int cap)
+{
+    ch->e         = e;
+    if (cap < 0) cap = 0;
+    if (cap > BLT_SPRITE_CHANNEL_MAX) cap = BLT_SPRITE_CHANNEL_MAX;
+    ch->cap       = cap;
+    ch->count     = 0;
+    ch->dropped   = 0;
+}
+
+/* DISCARD the current batch without committing it. The uncommitted entries sit
+ * above e->sp_used, so dropping `count` returns their bytes to the frame arena --
+ * which is exactly right for the caller that uses this (a hardware clear wipes the
+ * framebuffer, so buffered sprites must vanish rather than be emitted).
+ *
+ * `dropped` is NOT cleared here: it is a diagnostic accumulator owned by the
+ * caller's counter reset, not per-flush state. */
+void blt_sprite_channel_reset(blt_sprite_channel_t *ch)
+{
+    ch->count = 0;
+}
+
+int blt_sprite_channel_push(blt_sprite_channel_t *ch, const blt_sprite_run_key_t *k,
+                            const blt_sprite_entry_t *e)
+{
+    size_t off;
+    if (ch->count >= ch->cap) { ch->dropped++; return 0; }
+    /* The batch being accumulated occupies
+     * [sp_used, sp_used + count*BLT_SPRITE_ENTRY_BYTES). sp_used is
+     * only advanced when a flush COMMITS the batch, so entries already emitted this
+     * frame are never written over -- the fabric consumes nothing until C_SUBMIT, so
+     * every list's entries must survive intact until the frame ends. */
+    off = ch->e->sp_used + (size_t)ch->count * (size_t)BLT_SPRITE_ENTRY_BYTES;
+    /* Exhausting the per-frame arena drops the TAIL and counts it, exactly like the
+     * entry cap above (and surfaced by the same `dropped` diag counter). Wrapping or
+     * clamping here would silently paint one list's sprites from another's bytes. */
+    if (off + (size_t)BLT_SPRITE_ENTRY_BYTES > ch->e->sp_cap) { ch->dropped++; return 0; }
+    blt_pack_sprite_entry(ch->e->sp_buf + off, e);
+    ch->keys[ch->count] = *k;
+    ch->count++;
+    return 1;
+}
+
+int blt_sprite_channel_flush(blt_sprite_channel_t *ch, int16_t bias_x, int16_t bias_y)
+{
+    /* The batch's entries start at the frame cursor's CURRENT value; each emitted
+     * header carries the absolute SP_BUF offset of its OWN run. */
+    uint32_t base = (uint32_t)ch->e->sp_used;
+    int i = 0, runs = 0;
+    if (ch->count <= 0) return 0;
+    while (i < ch->count) {
+        int j = i + 1;
+        while (j < ch->count && !blt_sprite_run_key_differs(&ch->keys[j], &ch->keys[i]))
+            ++j;
+        blt_sprite_list(ch->e, ch->keys[i].src_stride, ch->keys[i].format,
+                        ch->keys[i].blend, ch->keys[i].colorkey, ch->keys[i].alpha,
+                        ch->keys[i].flags,
+                        base + (uint32_t)i * (uint32_t)BLT_SPRITE_ENTRY_BYTES, j - i,
+                        bias_x, bias_y);
+        runs++;
+        i = j;
+    }
+    /* COMMIT: the flushed bytes now belong to the frame and are off-limits to the
+     * next batch, until blt_begin_frame recycles the whole arena. */
+    ch->e->sp_used += (size_t)ch->count * (size_t)BLT_SPRITE_ENTRY_BYTES;
+    ch->count = 0;
+    return runs;
 }
 
 int blt_frt_upload(blt_emitter_t *e, uint32_t qword_count)
@@ -414,6 +601,64 @@ int blt_set_target(blt_emitter_t *e, int target_id)
     return emit(e, &c);
 }
 
+/* [PAL8 v1] Emit BLT_OP_CLUT_UPLOAD; see the doc comment in blt_emitter.h.
+ * Packs the qword count identically to blt_frt_upload's c.w/c.h split. */
+int blt_emit_clut_upload(blt_emitter_t *e, uint32_t clutbuf_off, uint32_t qw_count)
+{
+    blt_cmd_t c; memset(&c, 0, sizeof(c));
+    c.opcode  = BLT_OP_CLUT_UPLOAD;
+    c.src_off = clutbuf_off;                       /* [doc/future] see blt_emitter.h */
+    c.w = (uint16_t)(qw_count & 0xFFFF);            /* count low  16 */
+    c.h = (uint16_t)(qw_count >> 16);               /* count high 16 */
+    return emit(e, &c);
+}
+
+/* ─── [Stage 3b / grid, Phase B1 Task 3] blt_grid_list_init / blt_grid_list ── */
+
+void blt_grid_list_init(blt_emitter_t *e, uint32_t buf_off, uint32_t cap)
+{
+    e->grid_buf_off = buf_off;
+    e->grid_cap     = cap;
+    e->grid_used    = 0;
+}
+
+/* Header-only BLT_OP_TILEMAP. See the field-mapping doc comment in
+ * blt_emitter.h -- w|h<<16 carries grid_w|grid_h IN CELLS (not pixels, not an
+ * entry count, unlike every other list opcode's w|h<<16), dst_x|dst_y<<16
+ * carries the cell array's byte offset in GRID_BUF, src_x/src_y carry the
+ * signed per-batch dst bias (same convention as BLT_OP_TILELIST/_RES/
+ * SPRITELIST). Reuses the 32-byte command header verbatim -- blt_pack_cmd/
+ * blt_unpack_cmd (blt_wire.h) are NOT touched. */
+int blt_grid_list(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
+                  uint16_t colorkey, uint8_t alpha, uint8_t flags,
+                  uint32_t cells_off, uint16_t grid_w, uint16_t grid_h,
+                  int16_t bias_x, int16_t bias_y, uint16_t pal_color) {
+    if (grid_w == 0 || grid_h == 0) return 1;   /* nothing to draw, not an error */
+    blt_cmd_t c;
+    memset(&c, 0, sizeof c);
+    c.opcode = BLT_OP_TILEMAP;
+    c.blend_mode = blend;
+    c.format = tex.format;
+    c.flags  = flags;
+    /* [#33/#34] SAME SDRAM-vs-DDR source mux as tl_emit_header/blt_blit — see
+     * blt_cmd_apply_src. Omitting it (the original grid emitter's bug, PR #142) made
+     * the fabric read the atlas at the DDR3 heap offset instead of the staged SDRAM
+     * offset -> garbage tiles for every GRIDDED bucket. Routed through the shared
+     * resolver so it can never diverge from the other tile emitters again. */
+    blt_cmd_apply_src(e, tex, &c);
+    c.src_stride = tex.stride;
+    c.w = grid_w;              /* CELLS, not pixels, not an entry count */
+    c.h = grid_h;
+    c.dst_x = (uint16_t)(cells_off & 0xFFFFu);
+    c.dst_y = (uint16_t)(cells_off >> 16);
+    c.src_x = (uint16_t)bias_x;
+    c.src_y = (uint16_t)bias_y;
+    c.colorkey = colorkey;
+    c.alpha    = alpha;
+    c.color    = pal_color;
+    return emit(e, &c);
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
  *  Self-test. Build with -DBLT_EMITTER_SELFTEST and run on the host:
  *      cc -DBLT_EMITTER_SELFTEST -I patches/mister/blitter \
@@ -480,7 +725,7 @@ static void test_blt_tile_list_res(void) {
     /* TILELIST_RES header (header-only, entries are resident).
      * [#52 camera-independent] bias_x=3, bias_y=-5 must land in the header's
      * src_x/src_y slots (repurposed from informational texture bounds). */
-    CHECK(blt_tile_list_res(&e, tex, BLT_BLEND_COPY, 0, 255, 0, eoff, n, 3, -5) == 0,
+    CHECK(blt_tile_list_res(&e, tex, BLT_BLEND_COPY, 0, 255, 0, eoff, n, 3, -5, 0) == 0,
           "blt_tile_list_res returned non-zero");
     CHECK(e.tl_used == 0, "tl_used %zu exp 0 (header-only)", e.tl_used);
     blt_cmd_t c; blt_unpack_cmd(ring + BLT_CMD_BYTES, &c);   /* 2nd ring command */
@@ -493,6 +738,8 @@ static void test_blt_tile_list_res(void) {
     CHECK(nn == 7, "N %u exp 7", nn);
     uint32_t got = (uint32_t)(uint16_t)c.dst_x | ((uint32_t)(uint16_t)c.dst_y << 16);
     CHECK(got == eoff, "eoff %u exp %u", got, eoff);
+    CHECK(c.format == BLT_FMT_RGB565, "format %u exp RGB565", c.format);
+    CHECK(c.color == 0, "color %u exp 0 (non-PAL8)", c.color);
     printf("ok test_blt_tile_list_res\n");
 }
 
@@ -506,7 +753,7 @@ static void test_blt_tile_list_static(void) {
     blt_surface_ref_t tex = { .valid=1, .off=0x2000, .sdram_off=BLT_ALLOC_FAIL,
                               .stride=1024, .format=BLT_FMT_RGB565, .w=512, .h=512 };
     const uint32_t eoff = 96; const int n = 7;
-    CHECK(blt_tile_list_static(&e, tex, BLT_BLEND_COPY, 0, 255, 0, eoff, n, -4, 3) == 0,
+    CHECK(blt_tile_list_static(&e, tex, BLT_BLEND_COPY, 0, 255, 0, eoff, n, -4, 3, 0) == 0,
           "blt_tile_list_static returned non-zero");
     blt_cmd_t c; blt_unpack_cmd(ring, &c);
     CHECK(c.opcode == BLT_OP_TILELIST, "opcode %u exp %u", c.opcode, BLT_OP_TILELIST);
@@ -518,13 +765,320 @@ static void test_blt_tile_list_static(void) {
     CHECK(got == eoff, "eoff %u exp %u", got, eoff);
     CHECK(c.src_x == (uint16_t)-4, "bias_x (src_x) %u exp %u", c.src_x, (uint16_t)-4);
     CHECK(c.src_y == 3, "bias_y (src_y) %u exp 3", c.src_y);
+    CHECK(c.format == BLT_FMT_RGB565, "format %u exp RGB565", c.format);
+    CHECK(c.color == 0, "color %u exp 0 (non-PAL8)", c.color);
+
+    /* [PAL8 tile-list] a paletted tileset bucket: PAL8 tex + color=blt_pal_color(bank,base).
+     * The fabric latches c_format + c_color(->c_pal_id/c_base_off) from this header and
+     * applies them to every tile entry (proven equivalent by tb_pal8_tilelist.sv). */
+    blt_surface_ref_t ptex = { .valid=1, .off=0x5000, .sdram_off=0x1234,
+                               .stride=64, .format=BLT_FMT_PAL8, .w=64, .h=64 };
+    const uint16_t pcolor = blt_pal_color(/*pal_id=*/5, /*base_off=*/7);
+    CHECK(blt_tile_list_static(&e, ptex, BLT_BLEND_COPY, 0, 255, 0, eoff, n, 0, 0, pcolor) == 0,
+          "blt_tile_list_static (PAL8) returned non-zero");
+    blt_cmd_t pc; blt_unpack_cmd(ring + BLT_CMD_BYTES, &pc);   /* 2nd ring command */
+    CHECK(pc.opcode == BLT_OP_TILELIST, "PAL8 opcode %u exp %u", pc.opcode, BLT_OP_TILELIST);
+    CHECK(pc.format == BLT_FMT_PAL8, "PAL8 format %u exp %u", pc.format, BLT_FMT_PAL8);
+    CHECK(pc.color == pcolor, "PAL8 color %u exp %u", pc.color, pcolor);
+    CHECK(blt_pal_id(pc.color) == 5, "PAL8 pal_id %u exp 5", blt_pal_id(pc.color));
+    CHECK(blt_base_off(pc.color) == 7, "PAL8 base_off %u exp 7", blt_base_off(pc.color));
     printf("ok test_blt_tile_list_static\n");
+}
+
+/* [Stage 3b / grid, Phase B1 Task 4] blt_grid_list emits a header-only
+ * BLT_OP_TILEMAP with the OVERLOADED field mapping (w|h<<16 = grid dims IN
+ * CELLS, not an entry count; dst_x|dst_y<<16 = cells_off byte offset;
+ * src_x/src_y = signed bias, exercised here with NEGATIVE values because the
+ * bias is routinely negative in practice -- it is -camera). Proves the packed
+ * header round-trips through blt_pack_cmd/blt_unpack_cmd bit-exact. */
+static void test_blt_grid_static(void) {
+    uint8_t ring[4096], heap[4096], gridbuf[4096];
+    blt_emitter_t e;
+    blt_emitter_init(&e, ring, sizeof ring, heap, sizeof heap);
+    blt_grid_list_init(&e, 0x1000, sizeof gridbuf);
+    blt_begin_frame(&e, 0, 0, 0);
+
+    blt_surface_ref_t tex = { .valid=1, .off=0x3000, .sdram_off=BLT_ALLOC_FAIL,
+                              .stride=768, .format=BLT_FMT_RGB565, .w=384, .h=384 };
+    const uint32_t cells_off = 0x1234;
+    const uint16_t grid_w = 40, grid_h = 30;   /* cells, e.g. a 320x240 map */
+    const int16_t bias_x = -37, bias_y = -128; /* negative: -camera, the routine case */
+    const uint16_t pcolor = blt_pal_color(/*pal_id=*/3, /*base_off=*/9);
+
+    CHECK(blt_grid_list(&e, tex, BLT_BLEND_COPY, 0, 255, 0,
+                        cells_off, grid_w, grid_h, bias_x, bias_y, pcolor) == 0,
+          "blt_grid_list returned non-zero");
+
+    blt_cmd_t c; blt_unpack_cmd(ring, &c);
+    CHECK(c.opcode     == BLT_OP_TILEMAP, "opcode %u exp %u", c.opcode, BLT_OP_TILEMAP);
+    CHECK(c.src_off    == 0x3000,         "src_off 0x%x exp 0x3000", c.src_off);
+    CHECK(c.src_stride == 768,            "src_stride %u exp 768", c.src_stride);
+    CHECK(c.format     == BLT_FMT_RGB565, "format %u exp RGB565", c.format);
+    /* w|h<<16 = grid_w|grid_h<<16 (CELLS, not an entry count -- the field this
+     * opcode overloads differently from every other list opcode). */
+    CHECK(c.w == grid_w, "w %u exp grid_w %u", c.w, grid_w);
+    CHECK(c.h == grid_h, "h %u exp grid_h %u", c.h, grid_h);
+    /* dst_x|dst_y<<16 reconstructs cells_off exactly. */
+    uint32_t got_off = (uint32_t)(uint16_t)c.dst_x | ((uint32_t)(uint16_t)c.dst_y << 16);
+    CHECK(got_off == cells_off, "cells_off %u exp %u", got_off, cells_off);
+    /* src_x/src_y carry the signed bias, INCLUDING negative values. */
+    CHECK((int16_t)c.src_x == bias_x, "bias_x (src_x) %d exp %d", (int16_t)c.src_x, bias_x);
+    CHECK((int16_t)c.src_y == bias_y, "bias_y (src_y) %d exp %d", (int16_t)c.src_y, bias_y);
+    CHECK(c.color == pcolor, "color %u exp %u", c.color, pcolor);
+    CHECK(e.grid_used == 0, "grid_used %zu exp 0 (header-only)", e.grid_used);
+
+    /* [SDRAM source mux — regression] Source atlases are preloaded to SDRAM (#66), so a
+     * resident tex has a valid sdram_off and blt_grid_list MUST point the fabric at SDRAM
+     * (src_off = sdram_off + BLT_F_SRC_SDRAM) — the SAME mux tl_emit_header/blt_blit apply.
+     * The original grid emitter used tex.off unconditionally and set NO flag, so every
+     * GRIDDED tile read the atlas at the wrong (DDR3-heap) offset -> garbage (replay via
+     * OP_TILELIST was fine because it applies the mux). The above case uses
+     * sdram_off=BLT_ALLOC_FAIL so it never exercises this; assert the mux explicitly. */
+    e.sdram_src = 1;
+    blt_surface_ref_t stex = { .valid=1, .off=0x3000, .sdram_off=0x9abc,
+                               .stride=768, .format=BLT_FMT_RGB565, .w=384, .h=384 };
+    CHECK(blt_grid_list(&e, stex, BLT_BLEND_COPY, 0, 255, 0,
+                        cells_off, grid_w, grid_h, bias_x, bias_y, 0) == 0,
+          "blt_grid_list (sdram) returned non-zero");
+    blt_cmd_t sc; blt_unpack_cmd(ring + BLT_CMD_BYTES, &sc);   /* 2nd ring command */
+    CHECK(sc.src_off == 0x9abc, "sdram src_off 0x%x exp sdram_off 0x9abc", sc.src_off);
+    CHECK((sc.flags & BLT_F_SRC_SDRAM) != 0, "BLT_F_SRC_SDRAM not set on sdram grid cmd");
+    e.sdram_src = 0;
+
+    /* grid_w==0 / grid_h==0 -> 1 (nothing to draw, not an error), no command emitted. */
+    int before = e.cmd_count;
+    CHECK(blt_grid_list(&e, tex, BLT_BLEND_COPY, 0, 255, 0, cells_off, 0, grid_h, 0, 0, 0) == 1,
+          "blt_grid_list(grid_w=0) must return 1");
+    CHECK(e.cmd_count == before, "blt_grid_list(grid_w=0) must not emit a command");
+
+    printf("ok test_blt_grid_static\n");
+}
+
+/* [PAL8 v1, Task 2.3] blt_emit_clut_upload emits a header-only BLT_OP_CLUT_UPLOAD
+ * carrying the qword count in {c_h,c_w}, mirroring blt_frt_upload (see the FRT
+ * check inside test_blt_tile_list_res above). */
+static void test_blt_emit_clut_upload(void) {
+    uint8_t ring[4096], heap[4096];
+    blt_emitter_t e;
+    blt_emitter_init(&e, ring, sizeof ring, heap, sizeof heap);
+    blt_begin_frame(&e, 0, 0, 0);
+
+    CHECK(blt_emit_clut_upload(&e, 0x1234, 2048) == 0,
+          "blt_emit_clut_upload returned non-zero");
+    blt_cmd_t c; blt_unpack_cmd(ring, &c);
+    CHECK(c.opcode == BLT_OP_CLUT_UPLOAD, "opcode %u exp %u", c.opcode, BLT_OP_CLUT_UPLOAD);
+    uint32_t qc = (uint32_t)c.w | ((uint32_t)c.h << 16);
+    CHECK(qc == 2048, "clut qword count %u exp 2048", qc);
+    CHECK(c.src_off == 0x1234, "src_off 0x%x exp 0x1234", c.src_off);
+    printf("ok test_blt_emit_clut_upload\n");
+}
+
+/* [PAL8 v1, Task 2.3] blt_blit_pal8 sets format=BLT_FMT_PAL8 and packs
+ * pal_id/base_off into c.color, recoverable via blt_pal_id/blt_base_off
+ * (blt_wire.h) after a wire round-trip -- same accessors wire_pal8_test.c
+ * exercises directly on a hand-built blt_cmd_t. */
+static void test_blt_blit_pal8(void) {
+    uint8_t ring[4096], heap[8192];
+    blt_emitter_t e;
+    blt_emitter_init(&e, ring, sizeof ring, heap, sizeof heap);
+    blt_begin_frame(&e, 0, 0, 0);
+
+    blt_surface_ref_t tex = { .off=0x400, .stride=256, .w=64, .h=64,
+                              .format=BLT_FMT_RGB565, /* deliberately NOT PAL8 --
+                                  blt_blit_pal8 must force the wire format,
+                                  not trust the handle's upload-time format */
+                              .valid=1, .sdram_off=BLT_ALLOC_FAIL };
+
+    CHECK(blt_blit_pal8(&e, tex, 0, 0, 32, 32, 10, 20,
+                        BLT_BLEND_COLORKEY, 0, 255, 0, 0x5, 0x80) == 0,
+          "blt_blit_pal8 returned non-zero");
+    blt_cmd_t c; blt_unpack_cmd(ring, &c);
+    CHECK(c.opcode == BLT_OP_BLIT, "opcode %u exp %u", c.opcode, BLT_OP_BLIT);
+    CHECK(c.format == BLT_FMT_PAL8, "format %u exp BLT_FMT_PAL8(%u)", c.format, BLT_FMT_PAL8);
+    CHECK(blt_pal_id(c.color) == 0x5, "pal_id %u exp 0x5", blt_pal_id(c.color));
+    CHECK(blt_base_off(c.color) == 0x80, "base_off %u exp 0x80", blt_base_off(c.color));
+    printf("ok test_blt_blit_pal8\n");
+}
+
+/* [src-domain regression net] Every source-PIXEL-reading emitter must apply the
+ * SDRAM-vs-DDR3 source mux UNIFORMLY. PR #142's grid-emitter bug (OP_TILEMAP read
+ * the atlas at the DDR3-heap offset instead of the staged SDRAM offset -> garbage)
+ * fell out of this class: blt_grid_list open-coded `src_off = tex.off` while every
+ * other emitter open-coded the `use_sdram ? sdram_off : off` mux. The coverage hole
+ * that let #142 ship was that each per-emitter test used sdram_off=BLT_ALLOC_FAIL,
+ * so NONE exercised the staged branch. This one table asserts the mux for ALL
+ * source emitters at once, in all three scenarios, so a NEW source emitter added
+ * without the mux (or a regression in an existing one) fails immediately here. */
+typedef enum {
+    EM_BLIT, EM_BLIT_PAL8, EM_BLIT_MOD, EM_TL_STATIC, EM_TL_RES, EM_GRID
+} src_emitter_id;
+
+static const char *src_emitter_name(src_emitter_id id) {
+    switch (id) {
+    case EM_BLIT:      return "blt_blit";
+    case EM_BLIT_PAL8: return "blt_blit_pal8";
+    case EM_BLIT_MOD:  return "blt_blit_mod";
+    case EM_TL_STATIC: return "blt_tile_list_static";
+    case EM_TL_RES:    return "blt_tile_list_res";
+    case EM_GRID:      return "blt_grid_list";
+    }
+    return "?";
+}
+
+/* Emit exactly ONE source-reading command via the given emitter, using `ref` as the
+ * source. All non-source parameters are held constant/trivial -- the test only
+ * inspects src_off + BLT_F_SRC_SDRAM, which every one of these must resolve the same. */
+static void emit_one_src(blt_emitter_t *e, src_emitter_id id, blt_surface_ref_t ref) {
+    switch (id) {
+    case EM_BLIT:      blt_blit(e, ref, 0, 0, 16, 16, 0, 0, BLT_BLEND_COPY, 0, 255, 0); break;
+    case EM_BLIT_PAL8: blt_blit_pal8(e, ref, 0, 0, 16, 16, 0, 0, BLT_BLEND_COPY, 0, 255, 0, 0, 0); break;
+    case EM_BLIT_MOD:  blt_blit_mod(e, ref, 0, 0, 16, 16, 0, 0, BLT_BLEND_COPY, 0, 255, 0, 0, 0, 0); break;
+    case EM_TL_STATIC: blt_tile_list_static(e, ref, BLT_BLEND_COPY, 0, 255, 0, 0, 1, 0, 0, 0); break;
+    case EM_TL_RES:    blt_tile_list_res(e, ref, BLT_BLEND_COPY, 0, 255, 0, 0, 1, 0, 0, 0); break;
+    case EM_GRID:      blt_grid_list(e, ref, BLT_BLEND_COPY, 0, 255, 0, 0, 2, 2, 0, 0, 0); break;
+    }
+}
+
+static void check_src(const char *name, const char *scen, const blt_cmd_t *c,
+                      uint32_t exp_off, int exp_flag) {
+    CHECK(c->src_off == exp_off, "%s [%s]: src_off 0x%x exp 0x%x",
+          name, scen, c->src_off, exp_off);
+    int has = (c->flags & BLT_F_SRC_SDRAM) != 0;
+    CHECK(has == exp_flag, "%s [%s]: BLT_F_SRC_SDRAM=%d exp %d", name, scen, has, exp_flag);
+}
+
+static void test_src_domain_mux_all_emitters(void) {
+    static uint8_t ring[8192], heap[8192], tlbuf[4096], gridbuf[4096];
+    blt_emitter_t e;
+    const src_emitter_id ids[] = { EM_BLIT, EM_BLIT_PAL8, EM_BLIT_MOD,
+                                   EM_TL_STATIC, EM_TL_RES, EM_GRID };
+    /* A staged ref (valid sdram_off) and an unstaged one (FAIL); same DDR3 .off. */
+    const blt_surface_ref_t staged   = { .valid=1, .off=0x3000, .sdram_off=0x9abc,
+                                         .stride=64, .format=BLT_FMT_RGB565, .w=16, .h=16 };
+    const blt_surface_ref_t unstaged = { .valid=1, .off=0x3000, .sdram_off=BLT_ALLOC_FAIL,
+                                         .stride=64, .format=BLT_FMT_RGB565, .w=16, .h=16 };
+
+    for (size_t i = 0; i < sizeof ids / sizeof ids[0]; i++) {
+        const char *nm = src_emitter_name(ids[i]);
+        blt_cmd_t c;
+
+        /* A: SDRAM mode + STAGED source -> read from SDRAM offset, flag SET. */
+        blt_emitter_init(&e, ring, sizeof ring, heap, sizeof heap);
+        blt_tile_list_init(&e, tlbuf, sizeof tlbuf);
+        blt_grid_list_init(&e, 0, sizeof gridbuf);
+        e.sdram_src = 1;
+        blt_begin_frame(&e, 0, 0, 0);
+        emit_one_src(&e, ids[i], staged);
+        blt_unpack_cmd(ring, &c);
+        check_src(nm, "sdram+staged", &c, 0x9abc, 1);
+
+        /* B: mode OFF, even a staged ref -> read from DDR3 .off, NO flag (gated on mode). */
+        blt_emitter_init(&e, ring, sizeof ring, heap, sizeof heap);
+        blt_tile_list_init(&e, tlbuf, sizeof tlbuf);
+        blt_grid_list_init(&e, 0, sizeof gridbuf);
+        e.sdram_src = 0;
+        blt_begin_frame(&e, 0, 0, 0);
+        emit_one_src(&e, ids[i], staged);
+        blt_unpack_cmd(ring, &c);
+        check_src(nm, "mode-off", &c, 0x3000, 0);
+
+        /* C: SDRAM mode but UNSTAGED source -> falls back to DDR3 .off, NO flag.
+         * (This is the poison case the item-3 fault counter tracks: the fabric now
+         * hardwires SDRAM source, so a DDR3 offset here is read from SDRAM = garbage.) */
+        blt_emitter_init(&e, ring, sizeof ring, heap, sizeof heap);
+        blt_tile_list_init(&e, tlbuf, sizeof tlbuf);
+        blt_grid_list_init(&e, 0, sizeof gridbuf);
+        e.sdram_src = 1;
+        blt_begin_frame(&e, 0, 0, 0);
+        emit_one_src(&e, ids[i], unstaged);
+        blt_unpack_cmd(ring, &c);
+        check_src(nm, "sdram+unstaged", &c, 0x3000, 0);
+    }
+    printf("ok test_src_domain_mux_all_emitters\n");
+}
+
+/* [item 3 / src-domain fault] The fabric hardwires SDRAM source (blitter_top.sv
+ * src_in_sdram=1'b1), so a source command emitted in sdram_src mode with an UNSTAGED
+ * ref points a DDR3 heap offset at the SDRAM read port -> silent garbage (the shape of
+ * PR #142). blt_cmd_apply_src makes that case LOUD instead of silent: it bumps
+ * e->src_domain_fault so the renderer diag can surface it and tests can assert it never
+ * fires on good paths. Reset per frame, like e->dropped. NOT a hard abort: the current
+ * good paths always stage their sources, so this is a tripwire that should stay 0 --
+ * if it ever increments on HW it has caught a real wrong-domain emit. */
+static void test_src_domain_fault_counter(void) {
+    static uint8_t ring[8192], heap[8192], tlbuf[4096], gridbuf[4096];
+    blt_emitter_t e;
+    const src_emitter_id ids[] = { EM_BLIT, EM_BLIT_PAL8, EM_BLIT_MOD,
+                                   EM_TL_STATIC, EM_TL_RES, EM_GRID };
+    const blt_surface_ref_t staged   = { .valid=1, .off=0x3000, .sdram_off=0x9abc,
+                                         .stride=64, .format=BLT_FMT_RGB565, .w=16, .h=16 };
+    const blt_surface_ref_t unstaged = { .valid=1, .off=0x3000, .sdram_off=BLT_ALLOC_FAIL,
+                                         .stride=64, .format=BLT_FMT_RGB565, .w=16, .h=16 };
+    for (size_t i = 0; i < sizeof ids / sizeof ids[0]; i++) {
+        const char *nm = src_emitter_name(ids[i]);
+
+        /* SDRAM mode + STAGED -> legitimate SDRAM read, no fault. */
+        blt_emitter_init(&e, ring, sizeof ring, heap, sizeof heap);
+        blt_tile_list_init(&e, tlbuf, sizeof tlbuf);
+        blt_grid_list_init(&e, 0, sizeof gridbuf);
+        e.sdram_src = 1; blt_begin_frame(&e, 0, 0, 0);
+        emit_one_src(&e, ids[i], staged);
+        CHECK(e.src_domain_fault == 0, "%s: staged must NOT fault (%u)", nm, e.src_domain_fault);
+
+        /* SDRAM mode + UNSTAGED -> poison, exactly one fault. */
+        blt_emitter_init(&e, ring, sizeof ring, heap, sizeof heap);
+        blt_tile_list_init(&e, tlbuf, sizeof tlbuf);
+        blt_grid_list_init(&e, 0, sizeof gridbuf);
+        e.sdram_src = 1; blt_begin_frame(&e, 0, 0, 0);
+        emit_one_src(&e, ids[i], unstaged);
+        CHECK(e.src_domain_fault == 1, "%s: unstaged in sdram mode must fault once (%u)",
+              nm, e.src_domain_fault);
+
+        /* mode OFF -> DDR3 is legitimate, no fault. */
+        blt_emitter_init(&e, ring, sizeof ring, heap, sizeof heap);
+        blt_tile_list_init(&e, tlbuf, sizeof tlbuf);
+        blt_grid_list_init(&e, 0, sizeof gridbuf);
+        e.sdram_src = 0; blt_begin_frame(&e, 0, 0, 0);
+        emit_one_src(&e, ids[i], unstaged);
+        CHECK(e.src_domain_fault == 0, "%s: mode-off must NOT fault (%u)", nm, e.src_domain_fault);
+    }
+
+    /* Reset per frame: a fault, then a fresh begin_frame, clears it. */
+    blt_emitter_init(&e, ring, sizeof ring, heap, sizeof heap);
+    blt_grid_list_init(&e, 0, sizeof gridbuf);
+    e.sdram_src = 1; blt_begin_frame(&e, 0, 0, 0);
+    emit_one_src(&e, EM_BLIT, unstaged);
+    CHECK(e.src_domain_fault == 1, "pre-reset fault expected (%u)", e.src_domain_fault);
+    blt_begin_frame(&e, 0, 0, 0);
+    CHECK(e.src_domain_fault == 0, "begin_frame must reset src_domain_fault (%u)", e.src_domain_fault);
+    printf("ok test_src_domain_fault_counter\n");
 }
 
 int main(void) {
     test_blt_tile_list_res();
     test_blt_tile_list_static();
+    test_blt_grid_static();
     test_blt_fill_alpha();
+    test_blt_emit_clut_upload();
+    test_blt_blit_pal8();
+    test_src_domain_mux_all_emitters();
+    test_src_domain_fault_counter();
+
+    /* Ring-overflow drops must be COUNTED, not silent. */
+    {
+        blt_emitter_t e2;
+        static uint8_t ring2[BLT_CMD_BYTES * 4];
+        blt_emitter_init(&e2, ring2, sizeof ring2, NULL, 0);
+        blt_begin_frame(&e2, 0, 0, 0);
+        int rc = 0;
+        for (int i = 0; i < 32; i++)
+            rc |= blt_fill(&e2, 0, 0, 1, 1, 0);
+        if (rc == 0)          { printf("FAIL: expected overflow\n");            return 1; }
+        if (e2.overflow != 1) { printf("FAIL: overflow flag not set\n");         return 1; }
+        if (e2.dropped == 0)  { printf("FAIL: dropped not counted (%u)\n", e2.dropped); return 1; }
+        printf("ok: ring drops counted (%u dropped)\n", e2.dropped);
+    }
+
     if (g_fail == 0) { printf("blt_emitter self-test: PASS\n"); return 0; }
     printf("blt_emitter self-test: FAIL (%d)\n", g_fail);
     return 1;

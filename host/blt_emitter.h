@@ -1,3 +1,4 @@
+/* VENDORED from github.com/gmcnaught/mister-fpga-blitter (host/blt_emitter.h) — do not edit here; edit upstream + re-copy. */
 /*
  *  blt_emitter.h — engine-agnostic host-side blit display-list emitter.
  *
@@ -24,6 +25,7 @@
 
 #include "blitter_ref.h"   /* blt_cmd_t, BLT_OP_*, BLT_BLEND_*, BLT_F_*, BLT_FMT_* */
 #include "blt_alloc.h"     /* [MiSTer #14] free-list heap allocator (replaces the bump) */
+#include "blt_wire.h"      /* [Task 4] blt_sprite_entry_t / blt_pack_sprite_entry       */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -65,8 +67,42 @@ typedef struct {
     size_t   vtx_cap;    /* capacity in bytes                                        */
     size_t   vtx_used;   /* bytes used this frame (reset in blt_begin_frame)         */
 
+    /* [Task 3 / Stage 2] sprite-entry buffer -- its OWN region, deliberately NOT
+     * tl_buf: the sprite channel shares no storage with the resident
+     * tile-list machinery. Caller-owned (DDR region on hardware, malloc in tests). */
+    uint8_t *sp_buf;     /* sprite-entry buffer (own region, NOT tl_buf)          */
+    size_t   sp_cap;     /* capacity in bytes                                     */
+    size_t   sp_used;    /* bytes used this frame (reset in blt_begin_frame)      */
+
+    /* [Stage 3b / grid, Phase B1 Task 3] GRID_BUF region bookkeeping -- its OWN
+     * DDR region (see mister_blitter_renderer.cpp OFF_GRIDBUF/GRID_BUF_BYTES),
+     * shares no storage with tl_buf/sp_buf. Unlike tl_buf/sp_buf this is a
+     * region-relative BYTE OFFSET, not a host pointer: grid_build.h writes cells
+     * directly into the mapped GRID_BUF DDR region (or a caller-owned buffer in
+     * host tests) and blt_grid_list's `cells_off` argument is already the byte
+     * offset to pack into the header, so the emitter never dereferences these
+     * fields itself -- they exist for bookkeeping/diagnostics, mirroring
+     * tl_cap (also set-but-unread by the emitter; the value backstops future
+     * bounds-checking and documents which region is bound). */
+    uint32_t grid_buf_off; /* GRID_BUF region base, DDR-region-relative bytes    */
+    uint32_t grid_cap;     /* GRID_BUF region capacity in bytes                  */
+    size_t   grid_used;    /* bytes used this frame (reset in blt_begin_frame)   */
+
     int      cmd_count;  /* commands emitted this frame (excl. END until end_frame) */
     int      overflow;   /* set if a ring/heap capacity was exceeded   */
+    uint32_t dropped;    /* commands lost to ring-full this frame (reset per frame).
+                          * present() still submits, so this MUST be reported: a
+                          * non-zero value means the frame is missing content. */
+    uint32_t src_domain_fault; /* [#33/#34 src-domain] source-reading commands emitted
+                          * this frame whose source resolved to the DDR3 heap while
+                          * sdram_src mode is on (reset per frame, like `dropped`). The
+                          * fabric hardwires SDRAM source, so such a command reads a DDR3
+                          * offset out of SDRAM = garbage (the PR #142 shape). Good paths
+                          * always stage their sources, so this is a tripwire that must
+                          * stay 0; a non-zero value = a wrong-domain emit slipped through.
+                          * Set on every source-emit path via the shared resolver:
+                          * blt_cmd_apply_src for command emitters, and the renderer's
+                          * per-entry sprite path (which uses blt_src_off directly). */
 
     /* control-block mirror (the caller copies these to the DDR control block) */
     uint32_t submit_seq;
@@ -85,6 +121,17 @@ typedef struct {
     uint32_t size;       /* [MiSTer #14] heap bytes allocated (pass to blt_emitter_free) */
     uint32_t sdram_off;  /* [MiSTer #33] SDRAM offset of this surface, or BLT_ALLOC_FAIL if unstaged */
 } blt_surface_ref_t;
+
+/* [#33/#34 src-domain] THE single source of truth for the SDRAM-vs-DDR3 source mux
+ * that every source-PIXEL-reading emit path must use (blt_blit*, the tile-list and
+ * grid headers, and the renderer's per-entry sprite path). Source atlases are staged
+ * whole-quest into SDRAM (#66) and the fabric reads render source through the SDRAM
+ * P_SRC path, so a resident (staged) ref must be read from ref.sdram_off; an unstaged
+ * ref (or sdram_src mode off) falls back to the DDR3 heap ref.off. Pure/read-only:
+ * returns the resolved byte offset and, via *use_sdram (may be NULL), whether the
+ * caller must set BLT_F_SRC_SDRAM on the command/run-key. Centralizing this is the
+ * structural guard against the PR #142 class (an emitter open-coding the wrong offset). */
+uint32_t blt_src_off(const blt_emitter_t *e, blt_surface_ref_t ref, int *use_sdram);
 
 /* Bind the emitter to caller-owned ring + heap buffers. */
 void blt_emitter_init(blt_emitter_t *e, void *ring, size_t ring_cap,
@@ -117,6 +164,18 @@ void blt_begin_frame(blt_emitter_t *e, int target_buf, int clear,
 /* Emit a solid-fill rect (dst clipped + culled by the fabric). */
 int  blt_fill(blt_emitter_t *e, int x, int y, int w, int h, uint16_t color);
 
+/* Same as blt_fill, but with an explicit BLT_F_* flags byte.
+ *
+ * RETAINED (Stage 3b): this was originally added for the ARGB4444 plane bake
+ * (BLT_F_BGCOV cleared the bake-coverage tracker — see bgplane_coverage.sv —
+ * as this fill's pixel-write loop ran, instead of setting coverage bits).
+ * The bake was deleted host-side in Stage 3b Phase A and BLT_F_BGCOV is now
+ * RESERVED/unused (see blitter_ref.h), so this function is currently
+ * callerless. It is kept deliberately as a generic emitter API (a plain
+ * flags-parameterized fill is useful on its own) — do not delete it. */
+int  blt_fill_flags(blt_emitter_t *e, int x, int y, int w, int h, uint16_t color,
+                    uint8_t flags);
+
 /* Emit a blit of a sub-rect of `s` to (dx,dy). The command's source format is
  * taken from the surface handle (`s.format`).
  *   blend : BLT_BLEND_COPY | COLORKEY | CONST_ALPHA | PALPHA(ARGB4444 src)
@@ -138,6 +197,18 @@ int  blt_blit_mod(blt_emitter_t *e, blt_surface_ref_t s,
 
 /* Convenience: blit the whole surface opaquely to (dx,dy). */
 int  blt_blit_copy(blt_emitter_t *e, blt_surface_ref_t s, int dx, int dy);
+
+/* [PAL8 v1] Blit an 8bpp palette-indexed source (BLT_FMT_PAL8): identical to
+ * blt_blit but the format is forced to BLT_FMT_PAL8 (not taken from s.format)
+ * and `pal_id`/`base_off` are packed into the command's color field via
+ * blt_pal_color (blt_wire.h) -- blt_blit has no color parameter, so PAL8's
+ * palette-bank selection needs this dedicated emit path.
+ *   pal_id   : CLUT bank (0..31, see PAL_CLUT_BANKS in palette_atlas.h)
+ *   base_off : this surface's CLUT entries' starting slot within that bank */
+int  blt_blit_pal8(blt_emitter_t *e, blt_surface_ref_t s,
+                   int sx, int sy, int w, int h, int dx, int dy,
+                   uint8_t blend, uint16_t key, uint8_t alpha, uint8_t flags,
+                   uint8_t pal_id, uint8_t base_off);
 
 /* [v2] Fill with an explicit blend_mode (BLT_BLEND_ADD or BLT_BLEND_MULTIPLY).
  * Emits BLT_OP_FILL with blend_mode set; existing blt_fill always emits
@@ -211,14 +282,19 @@ void blt_tile_list_init(blt_emitter_t *e, void *tl_buf, size_t tl_cap);
  * this opcode, otherwise unused). Pass 0,0 for no bias. Same return contract as above. */
 int blt_tile_list_res(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
                       uint16_t key, uint8_t alpha, uint8_t flags,
-                      uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y);
+                      uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y,
+                      uint16_t color);
 
 /* [static tile-list] Emit a header-only BLT_OP_TILELIST pointing at `entry_off`
  * (N 12-byte blt_tile_entry_t already resident in tl_buf). bias_x/bias_y are a
- * signed per-batch dst bias (map-coord -> screen), carried in the header. */
+ * signed per-batch dst bias (map-coord -> screen), carried in the header.
+ * [PAL8] `color` carries the header colour field: for a BLT_FMT_PAL8 tex it is
+ * blt_pal_color(pal_id, base_off) (the fabric latches c_color -> c_pal_id/c_base_off
+ * for every entry); pass 0 for RGB565/ARGB4444 tilesets (colour field unused). */
 int blt_tile_list_static(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
                          uint16_t key, uint8_t alpha, uint8_t flags,
-                         uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y);
+                         uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y,
+                         uint16_t color);
 
 /* [#52 resident / Tier B] Emit BLT_OP_FRT_UPLOAD: tell the fabric to stream `qword_count`
  * qwords of the frame-rect table from the FRT DDR region into its frt BRAM (once/scene).
@@ -254,6 +330,137 @@ int blt_trilist(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
  * BLT_TARGET_APPSURF) for all subsequent commands in this frame's ring, until
  * the next blt_set_target call. Returns 0, or -1 + e->overflow on ring full. */
 int blt_set_target(blt_emitter_t *e, int target_id);
+
+/* [Task 3 / Stage 2] Bind the sprite-entry buffer (separate from the ring, the
+ * source heap, and tl_buf -- its own DDR region, SP_BUF, see
+ * mister_blitter_renderer.cpp OFF_SPBUF). */
+void blt_sprite_list_init(blt_emitter_t *e, void *sp_buf, size_t sp_cap);
+
+/* [Task 3 / Stage 2] Emit a header-only BLT_OP_SPRITELIST pointing at `entry_off`
+ * (N BLT_SPRITE_ENTRY_BYTES-sized blt_sprite_entry_t already resident in sp_buf).
+ * Each entry carries its own src_off (sprites, unlike tiles, don't share one
+ * texture) AND its own palette word (see [Task 4b] in blt_wire.h); src_stride/
+ * format/blend/key/alpha/flags are shared across the batch, so the caller must
+ * start a new list when any of them changes. bias_x/bias_y are a signed
+ * per-batch dst bias (map/world coord -> screen) added to every entry's dst by
+ * the fabric -- same convention as blt_tile_list_static/blt_tile_list_res.
+ * Returns 0, or -1 + e->overflow on ring full. */
+int blt_sprite_list(blt_emitter_t *e, uint32_t src_stride, uint8_t format, uint8_t blend,
+                    uint16_t key, uint8_t alpha, uint8_t flags,
+                    uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y);
+
+/* [Task 4 / Stage 2] The header fields an OP_SPRITELIST batch SHARES. A change in
+ * ANY of them must start a new list, because the fabric reads them once per command
+ * and applies them to every entry in the batch. Lives here (pure C, no engine types)
+ * so the renderer and the host test exercise the SAME comparator. */
+/* [Task 4b] The palette is deliberately NOT here: it moved into the ENTRY, so a
+ * sprite from a differently-paletted sheet must NOT break a run. `flags` stays --
+ * BLT_F_SRC_SDRAM in particular is genuinely per-header (a staged and an un-staged
+ * source cannot be read by one command). */
+typedef struct {
+    uint32_t src_stride;
+    uint8_t  format;
+    uint8_t  blend;
+    uint8_t  alpha;
+    uint16_t colorkey;
+    uint8_t  flags;
+} blt_sprite_run_key_t;
+
+static inline int blt_sprite_run_key_differs(const blt_sprite_run_key_t *a,
+                                             const blt_sprite_run_key_t *b)
+{
+    return a->src_stride != b->src_stride || a->format   != b->format
+        || a->blend      != b->blend      || a->alpha    != b->alpha
+        || a->colorkey   != b->colorkey   || a->flags    != b->flags;
+}
+
+/* [Task 4 / Stage 2] Maximum entries a channel can hold, and thus the size of the
+ * parallel key array. SP_BUF (128 KiB / BLT_SPRITE_ENTRY_BYTES=24) could hold 5461
+ * entries, but the channel is capped here so `keys` stays a fixed inline array (no
+ * allocation on the render path); blt_sprite_channel_init clamps a larger requested
+ * cap down to this. */
+#define BLT_SPRITE_CHANNEL_MAX 4096
+
+/* [Task 4 / Stage 2] Bounded ORDERED sprite accumulator. Entries are appended in
+ * emission order and never reordered -- that ordering IS the Z-order argument.
+ * Push returns 0 once the cap (or the byte capacity) is reached: the TAIL is
+ * dropped so the earliest (lowest-Z) sprites always survive, which degrades by
+ * losing the topmost sprites rather than by scrambling the scene. */
+typedef struct {
+    blt_emitter_t *e;      /* owns SP_BUF (sp_buf/sp_cap) AND its per-frame cursor  */
+    int      cap;          /* max entries (<= BLT_SPRITE_CHANNEL_MAX) */
+    int      count;        /* entries accepted into the CURRENT batch  */
+    uint32_t dropped;      /* entries refused at the cap or the budget */
+    blt_sprite_run_key_t keys[BLT_SPRITE_CHANNEL_MAX];
+} blt_sprite_channel_t;
+
+/* The channel does NOT take its own buffer: it writes into the emitter's SP_BUF
+ * arena (bound by blt_sprite_list_init) and allocates from the emitter's per-frame
+ * cursor `sp_used`. Two independent owners of one DDR region was the defect that
+ * made every flush but the last read another list's entries. */
+void blt_sprite_channel_init(blt_sprite_channel_t *ch, blt_emitter_t *e, int cap);
+void blt_sprite_channel_reset(blt_sprite_channel_t *ch);
+int  blt_sprite_channel_push(blt_sprite_channel_t *ch, const blt_sprite_run_key_t *k,
+                             const blt_sprite_entry_t *e);   /* 1 = accepted, 0 = dropped */
+
+/* [Task 4 / Stage 2] Emit the buffered batch as one BLT_OP_SPRITELIST per MAXIMAL
+ * run of entries whose run keys are equal, then reset the batch. Runs are walked in
+ * push order and the fabric executes the ring strictly in order, so the emitted
+ * sequence paints exactly in the order the draws arrived -- that IS the Z-order
+ * argument. Returns the number of OP_SPRITELIST commands emitted (0 if the batch
+ * was empty). Lives in the library rather than the renderer so the host test
+ * exercises the SAME flush the engine ships, not a re-implementation of it. */
+int  blt_sprite_channel_flush(blt_sprite_channel_t *ch, int16_t bias_x, int16_t bias_y);
+
+/* [PAL8 v1] Emit BLT_OP_CLUT_UPLOAD: tell the fabric to stream `qw_count` qwords
+ * (== CLUT entries, one 32-bit CLUT_MAKE word per qword) from the CLUTBUF DDR
+ * region into its clut BRAM (once/scene), mirroring blt_frt_upload's shape
+ * exactly ({c_h,c_w} = count, no framebuffer effect). `clutbuf_off` is carried
+ * in the command's src_off field for documentation/future use: the current
+ * fabric FSM (blitter_top.sv S_CLUT_RD/S_CLUT_WR) reads a FIXED CLUT_BUF_QW
+ * DDR region + a running index -- same fixed-region discipline as FRT_UPLOAD --
+ * so this field is not yet consumed by hardware. Returns 0, or -1 + e->overflow
+ * on ring full. */
+int blt_emit_clut_upload(blt_emitter_t *e, uint32_t clutbuf_off, uint32_t qw_count);
+
+/* [Stage 3b / grid, Phase B1 Task 3] Bind the GRID_BUF region (its own DDR
+ * region -- see mister_blitter_renderer.cpp OFF_GRIDBUF/GRID_BUF_BYTES,
+ * shares no storage with tl_buf/sp_buf). `buf_off` is the region-relative
+ * byte offset of GRID_BUF's base (NOT a host pointer, unlike
+ * blt_tile_list_init/blt_sprite_list_init) because grid cells are written
+ * directly into that DDR region by the caller (grid_build.h + a memcpy/DMA
+ * outside the emitter); the emitter only ever needs the offset to pack into
+ * a BLT_OP_TILEMAP header via blt_grid_list's `cells_off` argument. */
+void blt_grid_list_init(blt_emitter_t *e, uint32_t buf_off, uint32_t cap);
+
+/* [Stage 3b / grid, Phase B1 Task 3] Emit a header-only BLT_OP_TILEMAP command
+ * for a per-layer 8px cell GRID already resident at `cells_off` (a byte offset
+ * into the GRID_BUF DDR region, NOT relative to the `buf_off` bound by
+ * blt_grid_list_init -- see that offset's doc comment). REUSES the 32-byte
+ * command header verbatim (blt_pack_cmd/blt_unpack_cmd are NOT touched), with
+ * a field-mapping DELIBERATELY DIFFERENT from BLT_OP_TILELIST/_RES/SPRITELIST
+ * -- read carefully, this is the field most likely to be misread:
+ *   grid_w/grid_h : packed into the header as w | h<<16, but this is the grid
+ *                   RECTANGLE'S DIMENSIONS IN 8px CELLS (row-major, EVERY cell
+ *                   present per grid_cell.h's encoding -- including empty
+ *                   ones), NOT pixels and NOT an entry count the way
+ *                   BLT_OP_TILELIST/_RES/SPRITELIST use w|h<<16.
+ *   cells_off     : packed into dst_x | dst_y<<16, the byte offset of the
+ *                   cell array (grid_w * grid_h * 4 bytes, blt_grid_cell_t)
+ *                   within the GRID_BUF DDR region.
+ *   bias_x/bias_y : signed per-batch dst bias (map-coord -> screen, typically
+ *                   -camera), carried in src_x/src_y -- SAME convention as
+ *                   BLT_OP_TILELIST/_RES/SPRITELIST's header bias slots.
+ *   tex           : shared tileset texture (src_off/src_stride/format).
+ *   pal_color     : header colour field (PAL8 pal_id/base_off via
+ *                   blt_pal_color, or 0 for RGB565/ARGB4444 tilesets), same
+ *                   role as blt_tile_list_static/res's `color` parameter.
+ * Returns 0 on success, -1 + e->overflow on ring-full, or 1 (not an error) if
+ * grid_w or grid_h is 0 -- nothing to draw. */
+int blt_grid_list(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
+                  uint16_t colorkey, uint8_t alpha, uint8_t flags,
+                  uint32_t cells_off, uint16_t grid_w, uint16_t grid_h,
+                  int16_t bias_x, int16_t bias_y, uint16_t pal_color);
 
 #ifdef __cplusplus
 }

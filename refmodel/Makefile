@@ -2,7 +2,11 @@
 #   make test   build and run the unit tests + the embedded self-test
 #   make clean
 CC      ?= cc
-CFLAGS  ?= -O2 -std=c11 -Wall -Wextra -Werror
+# -I../host: blitter_ref.c decodes sprite entries / PAL8 palette words via the
+# shared wire codec (blt_wire.h), which lives with the emitter. Headers only —
+# no host .c is linked here.
+# (-I. lets blt_wire.h's own `#include "blitter_ref.h"` resolve back here.)
+CFLAGS  ?= -O2 -std=c11 -Wall -Wextra -Werror -I../host -I.
 
 test: test_blitter_ref selftest_ref test_blt_tri
 	./test_blitter_ref

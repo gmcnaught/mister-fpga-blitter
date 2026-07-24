@@ -62,10 +62,12 @@ Three architectural decisions define the core:
 
 1. **Display list in a DDR ring, walk-until-END.** The proven submit/done
    doorbell handshake survived every architecture revision unchanged. Batch
-   opcodes (`TILELIST` / `TILELIST_RES`) collapse a tile layer's thousands of
-   draws into one command whose entries live in a separate buffer, recorded
-   once per map in **map coordinates** — camera movement only re-biases the
-   header, so the A9's per-frame emit cost is a few dozen commands.
+   opcodes collapse whole layers into single commands whose entries live in
+   separate buffers: `TILELIST` / `TILELIST_RES` (tile layers, recorded once
+   per map in **map coordinates** — camera movement only re-biases the
+   header), `SPRITELIST` (Y-sorted sprite batches, per-entry texture +
+   palette), and `TILEMAP` (8px cell grids walked by the fabric with
+   run-coalescing). The A9's per-frame emit cost is a few dozen commands.
 2. **Framebuffer in on-chip BRAM, snapshot at vblank.** The compositor RMWs a
    persistent WORK image in M10K and hardware-copies WORK→SCAN at vblank for
    tear-free scanout. Destination preload/write-back traffic — 44–66 % of
@@ -78,6 +80,8 @@ Three architectural decisions define the core:
    composite. The pipeline composites at one pixel per clock (issue-interval 1)
    with colorkey, constant alpha, per-pixel alpha (ARGB4444), saturating ADD,
    MULTIPLY, and an RGB888 source tint — **nothing escapes to software**.
+   Sources are 16bpp RGB565/ARGB4444 or 8bpp `PAL8` resolved through an
+   on-chip 32-bank CLUT, which halves the atlas footprint.
 
 ## Prior art & acknowledgements
 
@@ -113,18 +117,20 @@ The software reference model is the executable spec — it builds and runs with
 no hardware and no dependencies:
 
 ```sh
-cd refmodel && make test   # 28 contract checks + embedded self-test
-cd host     && make test   # 22 emitter/codec checks + embedded self-test
-cd sim      && make test   # RTL ↔ model equivalence, 11 scenarios (iverilog)
+cd refmodel && make test   # 34 contract checks + TRILIST goldens + embedded self-test
+cd host     && make test   # 28 emitter/codec checks + self-test + grid gates
+cd libmfgpu && make test   # transform/cull → TRILIST display-list end-to-end
+cd sim      && make test   # RTL ↔ model equivalence, 17 scenarios (iverilog)
 ```
 
 `refmodel/blitter_ref.h` is the machine-readable copy of the command contract
 in `docs/blitter-protocol.md`. `refmodel/blitter_ref.c` defines the exact
 per-pixel semantics (FILL / COPY / COLORKEY / CONST_ALPHA / per-pixel alpha
-(ARGB4444) / ADD / MULTIPLY / color-mod tint / flips / clipping / tile lists /
-walk-until-END) that the RTL must reproduce bit-for-bit, including the
-divide-free /255 reductions. It is both the **golden output** the RTL is
-diffed against and the spec host command emitters develop against.
+(ARGB4444) / PAL8+CLUT / ADD / MULTIPLY / color-mod tint / flips / clipping /
+tile, sprite and grid lists / textured triangles / walk-until-END) that the
+RTL must reproduce bit-for-bit, including the divide-free /255 reductions. It
+is both the **golden output** the RTL is diffed against and the spec host
+command emitters develop against.
 
 ## Hardware validation (Solarus on MiSTer)
 
@@ -145,15 +151,42 @@ layer, and the remaining frame cost is game logic, not graphics.
 The engine backend lives in the `solarus-mister` repo and vendors `host/` +
 `refmodel/` from here.
 
+## MFGPU triangle front-end (in progress)
+
+Beyond rectangular blits, this repo is growing a minimal textured-triangle
+path — enough of a GPU for GLES-style 2.5D front-ends without leaving the
+32-byte command contract:
+
+- **`BLT_OP_TRILIST` (12)** — header-only command pointing at 16-byte
+  `blt_vtx_t` vertex triples in a separate vertex buffer; the rasterizer
+  (`refmodel/blt_tri.c` golden, `rtl/blt_tri.sv` bit-exact in sim) draws
+  textured, per-vertex-alpha triangles through the same blend modes.
+- **`BLT_OP_SET_TARGET` (13)** — switches compositing between the WORK
+  framebuffer and an off-screen app-surface render target, which TRILIST
+  draws can sample as a texture (`flags.SRC_SURFACE`) for render-to-texture
+  effects.
+- **`libmfgpu/`** — the A9-side front-end: fixed-point MVP transform to
+  screen 12.4, back-face/off-screen cull, batch assembly into TRILIST
+  display lists via the host emitter.
+
+Validated against the reference model and in RTL simulation (`sim/` tri
+scenarios); not yet deployed in the production solarus-mister fabric. The
+opcodes were renumbered 10→12 / 11→13 when `SPRITELIST`/`TILEMAP` shipped on
+hardware holding 10/11.
+
 ## Layout
 
 ```
 docs/          feasibility (go/no-go), protocol spec (the contract), lessons learned
 research-docs/  prior-art survey of existing MiSTer 2D-acceleration cores
 refmodel/      C reference model — golden output for the RTL, exec spec for host
-rtl/           SystemVerilog v1 spike (single-FSM, DDR framebuffer) — see rtl/README
-sim/           testbench + DDR model: v1 RTL ↔ reference-model equivalence
-host/          host-side command emitter + heap/SDRAM allocators (engine-agnostic)
+rtl/           SystemVerilog v1 spike (single-FSM, DDR framebuffer) + the
+               TRILIST rasterizer (blt_tri.sv) — see rtl/README
+sim/           testbench + DDR model: spike RTL ↔ reference-model equivalence
+host/          host-side command emitter + heap/SDRAM allocators + tilemap
+               grid builders (engine-agnostic)
+libmfgpu/      MFGPU geometry front-end: fixed-point transform/cull turning
+               triangle batches into TRILIST display lists — see below
 ```
 
 The **production fabric** (pipelined compositor `comp_pipeline.sv`, BRAM
@@ -171,12 +204,16 @@ emitter library that any engine port reuses.
 | Feasibility / architecture (go/no-go) | ✅ **GO** — `docs/blitter-feasibility.md` |
 | Command protocol + DDR ring + handshake | ✅ shipped v2 — `docs/blitter-protocol.md` |
 | Software reference model + tests | ✅ `refmodel/` — contract checks + self-test pass |
-| v1 RTL spike ↔ model equivalence in sim | ✅ `rtl/` + `sim/` — 11/11 pass |
+| v1 RTL spike ↔ model equivalence in sim | ✅ `rtl/` + `sim/` — 17/17 pass |
 | Host command emitter + wire codec + allocators | ✅ `host/` — checks + self-test pass |
 | Pipelined compositor (1 px/clk, all blends native) | ✅ production, in `solarus-mister:fpga/rtl/` |
 | Framebuffer in BRAM + vblank snapshot (tear-free) | ✅ production, HW-validated |
 | SDRAM-resident whole-quest atlases (128 MB) | ✅ production, HW-validated |
 | Tile-list batch opcodes (static + animated) | ✅ production, HW-validated |
+| Sprite-list batch opcode (`SPRITELIST`, per-entry texture/palette) | ✅ production, HW-validated |
+| Tilemap grid-walk opcode (`TILEMAP`, 8px cell grids + host builders) | ✅ production, HW-validated |
+| 8bpp paletted sources (`PAL8` + on-chip CLUT, halves atlas) | ✅ production, HW-validated |
+| MFGPU triangle front-end (`TRILIST`/`SET_TARGET`, `libmfgpu/`) | 🧪 sim + model validated, not yet deployed |
 | **On hardware (correct video, zero escapes, Solarus/MiSTer)** | ✅ **validated** — full quest playable |
 | Lessons learned (transport, timing, sizing) | 📓 `docs/lessons-learned.md` |
 

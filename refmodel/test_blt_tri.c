@@ -150,7 +150,7 @@ static void test_rotated_quad(void){
         uint16_t c = ((x+y)&1) ? 0x07E0 : 0xF800;   /* green / red checker */
         heapbuf[(y*4+x)*2]=c&0xFF; heapbuf[(y*4+x)*2+1]=c>>8;
     }
-    blt_surface_heap_t heap = { heapbuf, sizeof heapbuf, 0, 0 };
+    blt_surface_heap_t heap = { .base = heapbuf, .size = sizeof heapbuf };
     uint16_t fb[BLT_FB_WIDTH*BLT_FB_HEIGHT]; memset(fb,0,sizeof fb);
     blt_cmd_t h; memset(&h,0,sizeof h);
     h.opcode=BLT_OP_TRILIST; h.blend_mode=BLT_BLEND_COPY; h.format=BLT_FMT_RGB565;
