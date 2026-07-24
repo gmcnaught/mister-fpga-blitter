@@ -64,7 +64,7 @@ The `0x3A000000` region keeps the existing video/joystick/audio contract.
 | Phys base    | Size      | Purpose                                              |
 |--------------|-----------|------------------------------------------------------|
 | `0x3A000000` | 0x40      | (existing) video ctrl word + joy/cart/audio           |
-| `0x3A000040` | 2×150 KiB | (legacy) DDR3 framebuffers BUF0/BUF1 — pixels now in BRAM |
+| `0x3A000040` | 2×150 KiB | DDR3 scanout framebuffers FB0/FB1 — live again since Stage 5 Phase 2: the fabric burst-writes the on-chip WORK image to the inactive buffer at frame-done and flips `fb_bank`; the reader scans the active one (FB1 at `0x3A040040`). Between FB-in-BRAM (PR #49) and Stage 5 these were legacy/unused |
 | `0x3A070000` | 4 B       | `vsync_count` written by scanout — frame pacing       |
 | `0x3B000000` | 0x40      | blitter control block (§3)                            |
 | `0x3B000040` | **512 KiB** | command ring: ~16 382 × 32 B, walk-until-END        |

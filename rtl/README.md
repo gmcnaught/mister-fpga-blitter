@@ -44,6 +44,17 @@ is validated on hardware. What replaced this spike, in order (details in
   plan sketched here in v1 — with the target resident in BRAM there is nothing
   to DMA out, and the destination preload/write-back (44–66 % of compositor
   cycles) is simply gone.
+- `fb_ddr_writer.sv` + `ddr3_scan_adapter.sv` (Stage 5 Phase 2, 2026-07) —
+  the **scan half** of that double-buffer then moved back to DDR3 to relieve
+  BRAM pressure (`comp_fbram` was the largest M10K consumer; ~160 M10K
+  freed). WORK stays on-chip — the RMW cost above is still gone — but at
+  frame-done (immediately, not vblank-gated) `fb_ddr_writer` burst-streams
+  WORK to the inactive DDR3 framebuffer (skid-FIFO pipelined, ~1 beat/cyc)
+  and the fabric flips `fb_bank`; `ddr3_scan_adapter` replaces
+  `fbram_scan_adapter` behind the unchanged reader, turning per-qword scan
+  requests into one 80-qword DDR3 burst per scanline. In effect the v1
+  "composite on-chip, burst-DMA out" plan shipped after all — for the
+  finished frame only, never the RMW.
 - `sdram_fb_cache.sv` (jtframe cache mux + burst controller) — source atlases
   resident in SDRAM on a dedicated second bus, staged once at load by `STAGE`
   commands.
@@ -56,8 +67,8 @@ is validated on hardware. What replaced this spike, in order (details in
   8bpp `PAL8` sources (halves atlas size), and an immediate (non-vblank-gated)
   work→scan snapshot with fabric-owned `fb_bank` alternation for the DDR3
   double-buffer.
-- `fbram_scan_adapter.sv` — scanout served from BRAM with same-cycle reads;
-  the display deadline never touches a bus.
+- `fbram_scan_adapter.sv` — *(retired by Stage 5 above)* scanout served from
+  BRAM with same-cycle reads while the SCAN image lived on-chip.
 
 Every stage of that evolution stayed gated on bit-exactness against
 `../refmodel/` — the same golden model this spike is diffed against.
