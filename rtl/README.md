@@ -43,7 +43,13 @@ is validated on hardware. What replaced this spike, in order (details in
   commands.
 - `blitter_top.sv` (same name, evolved) — ring walk, decode, `TILELIST` /
   `TILELIST_RES` expansion from the tile-list buffer, staging FSM, snapshot
-  control.
+  control. Since then it has grown `SPRITELIST` (ordered 24-byte-entry sprite
+  batches from `SP_BUF`), the `TILEMAP` grid-walk FSM (per-layer 8px cell
+  grids from `GRID_BUF`, run-coalesced, timing-closed via split
+  `S_GRID_SETUP`/`S_GRID_BOUNDS` stages), `CLUT_UPLOAD` + on-chip CLUT for
+  8bpp `PAL8` sources (halves atlas size), and an immediate (non-vblank-gated)
+  work→scan snapshot with fabric-owned `fb_bank` alternation for the DDR3
+  double-buffer.
 - `fbram_scan_adapter.sv` — scanout served from BRAM with same-cycle reads;
   the display deadline never touches a bus.
 

@@ -1,3 +1,4 @@
+/* VENDORED from github.com/gmcnaught/mister-fpga-blitter (refmodel/blitter_ref.h) — do not edit here; edit upstream + re-copy. */
 /*
  *  blitter_ref.h — Software reference model for the MiSTer fabric 2D blitter.
  *
@@ -85,11 +86,55 @@ enum {
                           * from DDR (FRT region) into the fabric's frt BRAM. Header: *
                           *   w | h<<16 = qword count to copy. No framebuffer effect. *
                           * (Software ref model: tables are plain memory -> no-op.)   */
-    BLT_OP_TRILIST      = 10, /* [MFGPU] textured-triangle list (GLES front-end). Header *
+    BLT_OP_BGPLANE_WRITE = 8, /* RESERVED (Stage 3b): the bgplane bake was deleted
+                               * host-side. The value is held so host<->RTL opcode
+                               * numbering stays stable and test_wire_constants.py
+                               * keeps passing. Do NOT reuse 8 for a new op. */
+    BLT_OP_CLUT_UPLOAD   = 9, /* [PAL8 v1] stream the WHOLE CLUT (all 8 banks) from a  *
+                          * FIXED DDR region (CLUT_BUF_QW / OFF_CLUTBUF) into the      *
+                          * fabric's CLUT BRAM. The FSM (blitter_top S_CLUT_RD/WR)     *
+                          * reads ONLY the qword count; it does NOT consume src_off or *
+                          * a per-upload bank id (the region + layout are fixed):      *
+                          *   w | h<<16       = qword count (CLUT_BANKS*CLUT_ENTRIES,  *
+                          *                     one 32b entry per 64b qword)           *
+                          * No framebuffer effect. (Per-bank partial upload is a       *
+                          * possible future optimization; v1 uploads the full table.) */
+    BLT_OP_SPRITELIST = 10, /* [Stage 2] ordered camera-surface sprite batch.        *
+                          * SAME header packing as BLT_OP_TILELIST:                  *
+                          *   w | h<<16        = entry count N                       *
+                          *   dst_x | dst_y<<16= entry-array byte offset (in the same*
+                          *                      source heap, like BLT_OP_TILELIST)  *
+                          *   src_x/src_y      = signed per-batch dst bias           *
+                          *   src_stride/format/blend/alpha/colorkey/flags = shared  *
+                          * Each entry is a 24-byte blt_sprite_entry_t carrying its   *
+                          * OWN src_off — sprites do not share one texture the way    *
+                          * a tileset layer does. Entries composite in array order,   *
+                          * so Z-order == emission order.                             */
+    BLT_OP_TILEMAP = 11, /* [Stage 3b / grid] per-layer 8px cell GRID blit.           *
+                          * The N cells (see grid_cell.h) live in the GRID_BUF DDR    *
+                          * region as a flat grid_w x grid_h array (row-major, NOT    *
+                          * an entry count/list — every cell in the rectangle is      *
+                          * present, including empty ones per grid_cell.h's encoding).*
+                          * REUSES the 32-byte header verbatim, but two fields are    *
+                          * OVERLOADED differently than BLT_OP_TILELIST/_RES/SPRITELIST*
+                          * (read carefully — this is the field most likely misread): *
+                          *   w | h<<16        = grid_w | grid_h<<16, i.e. the grid   *
+                          *                      dimensions IN CELLS (8px each), NOT  *
+                          *                      pixels and NOT an entry count.       *
+                          *   dst_x | dst_y<<16= byte offset of the cell array within *
+                          *                      the GRID_BUF DDR region              *
+                          *   src_x/src_y      = signed per-batch dst bias (map-coord *
+                          *                      -> screen, typically -camera), SAME  *
+                          *                      convention as BLT_OP_TILELIST/_RES/  *
+                          *                      SPRITELIST                           *
+                          *   src_off/src_stride = shared tileset texture base        *
+                          *   blend_mode/format/flags/alpha/colorkey/color = shared   *
+                          *                      (color = pal_color, PAL8 palette id) */
+    BLT_OP_TRILIST      = 12, /* [MFGPU] textured-triangle list (GLES front-end). Header *
                           * carries texture-page params; dst_x|dst_y<<16 = byte offset  *
                           * of the first vertex in the entry buffer; w = triangle count.*
                           * Vertices are blt_vtx_t triples (see below). */
-    BLT_OP_SET_TARGET   = 11, /* [app-surface render target, step 1] switch the composite
+    BLT_OP_SET_TARGET   = 13, /* [app-surface render target, step 1] switch the composite
                           * write/read target among BLT_TARGET_*. cmd.color low byte =
                           * target id; all other fields unused/zero. Persists until the
                           * next SET_TARGET (or frame end, which resets to WORK). No
@@ -111,7 +156,7 @@ enum {
 
 /* [#52 resident / Tier B] resident table dimensions (host + RTL MUST agree; mirrored
  * in fpga/rtl/blitter_defs.vh). MAXP patterns x MAXF frames. */
-#define BLT_MAXP  128   /* max distinct animated patterns per scene */
+#define BLT_MAXP  256   /* max distinct animated patterns per scene (Stage 3b B2: map 3 = 251) */
 #define BLT_MAXF  8     /* max frames per pattern (final_frame_index in [0,MAXF)) */
 
 /* ---- Blend modes (cmd.blend_mode), for BLT_OP_BLIT ---------------------- */
@@ -138,7 +183,10 @@ enum {
 enum {
     BLT_FMT_RGB565   = 0, /* 16bpp, no per-pixel alpha                        */
     BLT_FMT_ARGB4444 = 1, /* 16bpp {A4,R4,G4,B4} (A in [15:12]); per-px alpha */
-    /* BLT_FMT_ARGB8888 = 2  -> future                                        */
+    BLT_FMT_PAL8     = 2, /* 8bpp palette-indexed; color field = pal_id[12:8]  *
+                           * | base_off[7:0] (palette selection + CLUT offset). *
+                           * pal_id is 5 bits (32 banks) per blt_pal_color and  *
+                           * comp_pipeline.sv's c_pal_id[4:0]; bits[15:13] free */
 };
 
 /* ---- Flags (cmd.flags bitfield) ----------------------------------------- */
@@ -159,6 +207,17 @@ enum {
                                 * (divide-free /255, same reduction as blt_blend565). CLEAR => no mod
                                 * (true no-op; v1 zero-pad stays correct). Host sets it only when
                                 * (cr,cg,cb) != (255,255,255). Orthogonal to blend_mode (composes). */
+/* ---- bit 0x80: per-opcode SHARED bit (the u8 flags field is full) ---------
+ * BLT_F_BGCOV holds 0x80 for the tile/blit opcode family: the Stage 3b bake
+ * coverage bit, no longer emitted, value held for wire-ABI stability against
+ * deployed bitstreams. BLT_F_SRC_SURFACE reuses the SAME bit but is decoded
+ * ONLY on BLT_OP_TRILIST commands (an opcode no deployed solarus bitstream
+ * dispatches), so the two never meet on the wire. Any future op wanting a
+ * flag bit must widen the field or reuse per-opcode like this — and say so
+ * here. */
+#define BLT_F_BGCOV     0x80u  /* RESERVED (Stage 3b): bake coverage bit, no longer
+                                * emitted. Value held for wire-ABI stability.
+                                * Tile/blit opcode family ONLY — see note above. */
 #define BLT_F_SRC_SURFACE 0x80u /* [app-surface render target, step 1] TRILIST: sample the
                                 * off-screen application-surface BRAM surface (the
                                 * BLT_TARGET_APPSURF render target) as this draw's texel
@@ -177,9 +236,9 @@ enum {
                                 * NOTE: this is bit 0x80, not the 0x10 the
                                 * step-1 plan doc originally guessed nor the 0x40 later
                                 * proposed — both are already taken (BLT_F_SRC_SDRAM,
-                                * BLT_F_COLORMOD); 0x80 is the only free bit in the u8
-                                * flags field. Flagged to the FPGA team for cross-check
-                                * before their side locks against it. */
+                                * BLT_F_COLORMOD). 0x80 is SHARED with the retired
+                                * BLT_F_BGCOV per the note above: TRILIST-only decode,
+                                * so deployed tile/blit paths never see it set. */
 
 /*
  *  Blit command — 32 bytes / 8x uint32. Layout is the on-wire DDR ring entry;
@@ -284,7 +343,29 @@ typedef struct {
      *   cft: uint16_t[BLT_MAXP] current (mirror-resolved) frame index per pattern.    */
     const uint8_t *frt;
     const uint8_t *cft;
+    /* [PAL8 / Task 4b] optional CLUT mirror for BLT_FMT_PAL8 sources:
+     * BLT_CLUT_BANKS*BLT_CLUT_ENTRIES 32-bit little-endian words, addressed
+     * [pal_id*BLT_CLUT_ENTRIES + ((index + base_off) & 0xFF)] — exactly
+     * comp_pipeline.sv's clut_rd_addr = {c_pal_id[4:0], index[7:0]+c_base_off}.
+     * Word layout mirrors comp_clut.vh's CLUT_MAKE: bits[15:0] = RGB565,
+     * bits[19:16] = 4-bit alpha. NULL (zero-initialized) for non-paletted
+     * command lists; a PAL8 command with no CLUT bound reads as colour 0. */
+    const uint8_t *clut;
+    /* [Stage 3b / grid, Phase B1 Task 4] optional GRID_BUF mirror for
+     * BLT_OP_TILEMAP. The cell array lives in ITS OWN DDR region, separate
+     * from `base` (unlike BLT_OP_TILELIST/_RES/SPRITELIST entry arrays, which
+     * share the texture heap — see blt_emitter.h's blt_grid_list_init doc
+     * comment). In hardware this is the DDR region the fabric's grid-cell
+     * read master fetches from; in the model it is a plain host buffer of
+     * blt_grid_cell_t (grid_cell.h), cells_off-addressed (byte offset). NULL
+     * (zero-initialized) for command lists with no BLT_OP_TILEMAP. */
+    const uint8_t *grid;
 } blt_surface_heap_t;
+
+/* [PAL8] CLUT geometry, mirroring fpga/rtl/comp_clut.vh (CLUT_BANKS/CLUT_ENTRIES).
+ * pal_id is 5 bits (32 banks) and the slot index is 8 bits (256 entries). */
+#define BLT_CLUT_BANKS   32u
+#define BLT_CLUT_ENTRIES 256u
 
 /*
  *  Execute a command list against a 320x240 RGB565 framebuffer.
@@ -302,6 +383,47 @@ int blt_execute(uint16_t *fb,
                 const blt_surface_heap_t *heap,
                 const blt_cmd_t *cmds,
                 int count);
+
+/* [Stage 2] Execute one BLT_OP_SPRITELIST batch: `n` 24-byte blt_sprite_entry_t
+ * (see blt_wire.h) packed little-endian at heap->base + entry_off — SAME
+ * convention as BLT_OP_TILELIST: the entry array lives in the same source heap
+ * blt_execute was given, at the header's dst_x|dst_y<<16 byte offset. `header`
+ * carries the shared params (src_stride/format/blend_mode/flags/alpha/colorkey)
+ * exactly as the BLT_OP_SPRITELIST command word does; only src_off/src_x/src_y/
+ * w/h/dst_x/dst_y/color are overridden per entry, each from its OWN src_off
+ * (sprites, unlike tiles, do not share one texture) and its OWN palette word
+ * (Y-sorted sprites come from sheets with different palettes; see [Task 4b] in
+ * blt_wire.h) -- the header's own color field is NOT a fallback. bias_x/bias_y are the signed
+ * per-batch dst bias (map-coord -> screen) ADDED to every entry's dst — same
+ * convention as BLT_OP_TILELIST/BLT_OP_TILELIST_RES. Exposed (not static) so
+ * both blt_execute's BLT_OP_SPRITELIST case and host tests can call it. */
+void blt_ref_sprite_list(uint16_t *fb, const blt_surface_heap_t *heap,
+                         const blt_cmd_t *header, uint32_t entry_off, int n,
+                         int16_t bias_x, int16_t bias_y);
+
+/* [Stage 3b / grid, Phase B1 Task 4] Execute one BLT_OP_TILEMAP grid walk —
+ * the golden model B2's RTL tilemap_unit is validated against. `cells_off`
+ * is the byte offset (already reconstructed from the header's dst_x|dst_y<<16)
+ * of a flat grid_w x grid_h array of blt_grid_cell_t (grid_cell.h) at
+ * heap->grid, row-major, EVERY cell present (including empty ones — see
+ * grid_cell.h). Screen position of cell (cx,cy) is (cx*8+bias_x, cy*8+bias_y).
+ * The walk visits only the cell window visible on the 320x240 framebuffer
+ * (a fully off-screen grid issues no blits at all — CV1000-style cull, like
+ * every other list op) and, for each visible row, issues ONE blit per
+ * contiguous non-empty run (grid_cell.h's run_m1, clamped so it never crosses
+ * the visible window's right edge), skipping EMPTY cells one at a time. The
+ * pattern source rect is resolved from the SAME per-pattern frame-rect table
+ * BLT_OP_TILELIST_RES uses — FRT[pid][CFT[pid]] — offset by (sub_x*8, sub_y*8).
+ * bias_x/bias_y are the signed per-batch dst bias (map-coord -> screen), same
+ * convention as every other list op. Every per-cell blit is clipped to the
+ * framebuffer in SIGNED space before any destination coordinate is cast to an
+ * unsigned field (the #24 out-of-bounds class — a negative destination must
+ * clip, never wrap). Exposed (not static) so both blt_execute's
+ * BLT_OP_TILEMAP case and host tests can call it directly. */
+void blt_ref_tilemap(uint16_t *fb, const blt_surface_heap_t *heap,
+                     const blt_cmd_t *header, uint32_t cells_off,
+                     uint16_t grid_w, uint16_t grid_h,
+                     int16_t bias_x, int16_t bias_y);
 
 /*
  *  Rasterize a textured-triangle list into the framebuffer (BLT_OP_TRILIST).

@@ -18,7 +18,13 @@ make test     # emitter + codec unit tests AND the embedded self-test (no hardwa
 | `blt_wire.h` | **canonical** pack/unpack between `blt_cmd_t` and the 32-byte on-wire command. Shared by the emitter, `sim/gen_vectors.c`, and any RTL cross-check — one source of truth for the command layout (including the COLORMOD tint bytes and the tile-list header reuse). |
 | `blt_emitter.{h,c}` | the emitter: command ring builder, source-heap uploads (RGB565 + ARGB4444), `STAGE`/SDRAM staging incl. the permanent (grow-only) residency region, tile-list emission, blended/alpha fills, color-mod blits, `cmd_count`/`submit_seq` latching. Embedded self-test via `-DBLT_EMITTER_SELFTEST`. |
 | `blt_alloc.{h,c}` | free-list, first-fit + coalescing **offset allocator** used for the DDR3 heap and both SDRAM regions. Replaced the v1 bump allocator: with dynamic surfaces, a bump pointer leaks on every invalidate and overflows on scene transitions. |
-| `test_emitter.c` | unit tests (22 checks). |
+| `grid_cell.h` (in `../refmodel/`) | 32-bit `TILEMAP` grid-cell encoding (pattern id, sub-tile, run length) — shared with the reference model's grid walk, bit positions pinned host↔fabric. |
+| `grid_build.h` | grid builder: writes cell arrays into `GRID_BUF` with horizontal run coalescing. |
+| `grid_alloc.h` | `GRID_BUF` bump allocator (qword-align + cap enforcement). |
+| `grid_decompose.h` | stack-height overlap layering — decomposes overlapping tile stacks into per-layer grids. |
+| `grid_stats.h` | fabric-faithful empty/run counters for compositor-time attribution. |
+| `test_emitter.c` | unit tests (28 checks). |
+| `test_grid_alloc.c`, `test_grid_walk_equiv.c` | GRID_BUF allocator gate + grid-walk ≡ per-tile-blits equivalence gate (full-cull / 16-run / edge-clip cases). |
 
 ## Usage sketch
 

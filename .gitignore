@@ -32,3 +32,8 @@ qdb/
 ._*
 refmodel/selftest_ref
 host/selftest_emitter
+refmodel/test_blt_tri
+host/test_grid_alloc
+host/test_grid_walk_equiv
+libmfgpu/test_mfgpu
+libmfgpu/test_xform

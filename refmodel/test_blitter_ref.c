@@ -67,7 +67,7 @@ static void test_copy(void)
     uint16_t *fb = new_fb(0x001F); /* blue bg */
     size_t sz;
     uint8_t *surf = make_surface(8, 8, 0x07E0, &sz); /* green */
-    blt_surface_heap_t heap = { surf, sz, NULL, NULL };
+    blt_surface_heap_t heap = { .base = surf, .size = sz };
     blt_cmd_t cmds[2] = {0};
     cmds[0].opcode = BLT_OP_BLIT; cmds[0].blend_mode = BLT_BLEND_COPY;
     cmds[0].format = BLT_FMT_RGB565;
@@ -89,7 +89,7 @@ static void test_colorkey(void)
     uint16_t *fb = new_fb(0x001F);
     /* 2x1 surface: pixel0 = key (0x0000), pixel1 = green */
     uint8_t surf[4] = { 0x00, 0x00, 0xE0, 0x07 };
-    blt_surface_heap_t heap = { surf, sizeof(surf), NULL, NULL };
+    blt_surface_heap_t heap = { .base = surf, .size = sizeof(surf) };
     blt_cmd_t cmds[2] = {0};
     cmds[0].opcode = BLT_OP_BLIT; cmds[0].blend_mode = BLT_BLEND_COLORKEY;
     cmds[0].src_stride = 4; cmds[0].w = 2; cmds[0].h = 1;
@@ -108,7 +108,7 @@ static void test_const_alpha(void)
     uint16_t *fb = new_fb(0x0000); /* black dst */
     size_t sz;
     uint8_t *surf = make_surface(2, 2, 0xFFFF, &sz); /* white src */
-    blt_surface_heap_t heap = { surf, sz, NULL, NULL };
+    blt_surface_heap_t heap = { .base = surf, .size = sz };
     blt_cmd_t cmds[2] = {0};
     cmds[0].opcode = BLT_OP_BLIT; cmds[0].blend_mode = BLT_BLEND_CONST_ALPHA;
     cmds[0].src_stride = 4; cmds[0].w = 2; cmds[0].h = 2;
@@ -132,7 +132,7 @@ static void test_flips(void)
        (0,0)=A 0x0001  (1,0)=B 0x0002
        (0,1)=C 0x0003  (1,1)=D 0x0004 */
     uint8_t surf[8] = { 1,0, 2,0, 3,0, 4,0 };
-    blt_surface_heap_t heap = { surf, sizeof(surf), NULL, NULL };
+    blt_surface_heap_t heap = { .base = surf, .size = sizeof(surf) };
 
     /* HFLIP: top row becomes B,A */
     uint16_t *fb = new_fb(0x0000);
@@ -159,7 +159,7 @@ static void test_clipping(void)
     printf("test_clipping\n");
     size_t sz;
     uint8_t *surf = make_surface(16, 16, 0xFFFF, &sz);
-    blt_surface_heap_t heap = { surf, sz, NULL, NULL };
+    blt_surface_heap_t heap = { .base = surf, .size = sz };
 
     /* Negative dst origin: only the in-bounds part is drawn, correct src pixel */
     uint16_t *fb = new_fb(0x0000);
@@ -282,7 +282,7 @@ static void test_surface_src(void)
 
     uint8_t heapbuf[6 * sizeof(blt_vtx_t)];
     memcpy(heapbuf, verts, sizeof heapbuf);
-    blt_surface_heap_t heap = { heapbuf, sizeof heapbuf, NULL, NULL };
+    blt_surface_heap_t heap = { .base = heapbuf, .size = sizeof heapbuf };
 
     uint16_t *fb = new_fb(0x0000);
     int executed = blt_execute(fb, &heap, cmds, n);
@@ -298,7 +298,7 @@ static void test_surface_src(void)
 
 static void test_trilist_layout(void){
     assert(sizeof(blt_vtx_t) == 16);
-    assert(BLT_OP_TRILIST == 10);
+    assert(BLT_OP_TRILIST == 12);
     blt_vtx_t v = { .x=1, .y=2, .u=3, .v=4, .rgba=BLT_RGBA(10,20,30,40), ._rsvd=0 };
     assert((v.rgba & 0xff)==10 && ((v.rgba>>24)&0xff)==40);
     printf("test_trilist_layout OK\n");

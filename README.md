@@ -171,12 +171,16 @@ emitter library that any engine port reuses.
 | Feasibility / architecture (go/no-go) | ✅ **GO** — `docs/blitter-feasibility.md` |
 | Command protocol + DDR ring + handshake | ✅ shipped v2 — `docs/blitter-protocol.md` |
 | Software reference model + tests | ✅ `refmodel/` — contract checks + self-test pass |
-| v1 RTL spike ↔ model equivalence in sim | ✅ `rtl/` + `sim/` — 11/11 pass |
+| v1 RTL spike ↔ model equivalence in sim | ✅ `rtl/` + `sim/` — 17/17 pass |
 | Host command emitter + wire codec + allocators | ✅ `host/` — checks + self-test pass |
 | Pipelined compositor (1 px/clk, all blends native) | ✅ production, in `solarus-mister:fpga/rtl/` |
 | Framebuffer in BRAM + vblank snapshot (tear-free) | ✅ production, HW-validated |
 | SDRAM-resident whole-quest atlases (128 MB) | ✅ production, HW-validated |
 | Tile-list batch opcodes (static + animated) | ✅ production, HW-validated |
+| Sprite-list batch opcode (`SPRITELIST`, per-entry texture/palette) | ✅ production, HW-validated |
+| Tilemap grid-walk opcode (`TILEMAP`, 8px cell grids + host builders) | ✅ production, HW-validated |
+| 8bpp paletted sources (`PAL8` + on-chip CLUT, halves atlas) | ✅ production, HW-validated |
+| MFGPU triangle front-end (`TRILIST`/`SET_TARGET`, `libmfgpu/`) | 🧪 sim + model validated, not yet deployed |
 | **On hardware (correct video, zero escapes, Solarus/MiSTer)** | ✅ **validated** — full quest playable |
 | Lessons learned (transport, timing, sizing) | 📓 `docs/lessons-learned.md` |
 
