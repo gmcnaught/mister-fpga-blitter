@@ -6,10 +6,16 @@ A single-module functional blitter: walks the DDR command ring (until `END` /
 `cmd_count`), decodes 32-byte commands, composites into the framebuffer
 (FILL / COPY / COLORKEY / CONST_ALPHA / per-pixel alpha (PALPHA, ARGB4444 src) /
 H+V flip / clip+cull), and writes the video control word as a drop-in producer.
-**Diffed bit-exact against the C reference model** over 11 scenarios — `cd ../sim
-&& make test`. The blend path uses a divide-free /255 reduction split across
-pipeline stages, and source/dest addressing is incremental (registered) for
-timing.
+It also hosts the MFGPU `TRILIST` (opcode 12) engine: vertex fetch/decode
+states driving `blt_tri.sv`, a combinational per-pixel evaluator for textured
+triangle lists (integer 12.4 edge functions with the top-left fill rule,
+nearest-texel sampling, per-vertex colour/alpha interpolation) — bit-exact to
+`../refmodel/blt_tri.c` by construction, a simulation-equivalence model rather
+than a synthesis-optimized datapath.
+**Diffed bit-exact against the C reference model** over 17 scenarios (incl.
+6 `tri_*` cases) — `cd ../sim && make test`. The blend path uses a divide-free
+/255 reduction split across pipeline stages, and source/dest addressing is
+incremental (registered) for timing.
 
 `blitter_defs.vh` — shared sim memory layout (kept in sync with
 `../sim/gen_vectors.c`). The command packing (`qw[k]={u32[2k+1],u32[2k]}`) is

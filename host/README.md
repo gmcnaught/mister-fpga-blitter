@@ -42,6 +42,10 @@ blt_stage_surface_perm(&e, &atlas);
 blt_begin_frame(&e, target_buf, /*clear=*/1, bg_rgb565);
 blt_tile_list_static(&e, atlas, BLT_BLEND_COLORKEY, key, 0, 0,
                      entry_off, n_tiles, bias_x, bias_y);   /* whole layer */
+blt_grid_list(&e, atlas, BLT_BLEND_COLORKEY, key, 0, 0,     /* or: 8px cell */
+              cells_off, grid_w, grid_h, bias_x, bias_y, 0);/* grid walk    */
+blt_sprite_list(&e, stride, fmt, BLT_BLEND_COLORKEY, key, 0, 0,
+                sp_entry_off, n_sprites, bias_x, bias_y);   /* Y-sorted batch */
 blt_blit(&e, atlas, sx,sy, w,h, dx,dy, BLT_BLEND_COLORKEY, key, 0, 0);
 blt_fill_alpha(&e, 0,0, 320,240, 0 /*black*/, fade_alpha);  /* fade overlay */
 blt_end_frame(&e);

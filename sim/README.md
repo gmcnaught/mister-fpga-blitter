@@ -1,8 +1,8 @@
 # sim/ — RTL ↔ reference-model equivalence
 
 Proves `rtl/blitter_top.sv` (the v1 spike) produces **bit-identical**
-framebuffers to the C reference model (`refmodel/`) over the v1 command set,
-with no hardware.
+framebuffers to the C reference model (`refmodel/`) over the v1 command set
+plus the TRILIST rasterizer (`rtl/blt_tri.sv`), with no hardware.
 
 ```sh
 make test     # build + run all scenarios (needs iverilog + cc)
@@ -25,18 +25,22 @@ make clean
 The scenarios mirror the reference-model unit tests so RTL and model coverage
 line up.
 
-## Scenarios (11, all passing)
+## Scenarios (17, all passing)
 
 `fill · copy · colorkey · alpha · hflip · vflip · clip_neg · clip_off ·
-overdraw · clear · target1`
+overdraw · clear · target1 ·
+tri_copy · tri_alpha · tri_overlap · tri_add · tri_clip · tri_rot`
 
-The reference model itself has grown past this set (PALPHA, ADD, MULTIPLY,
-COLORMOD tint, STAGE, tile lists — see `docs/blitter-protocol.md`); it stays
-backward-exact on the v1 semantics, which is what this suite pins. The v2
-semantics are held bit-exact by the model's embedded self-test
-(`refmodel/ make test`) and by the production fabric's own gating testbenches
-(`tb_blitter_*` in the `solarus-mister` repo), which diff each pipeline stage
-against the same golden functions.
+The `tri_*` scenarios drive `BLT_OP_TRILIST` through `rtl/blt_tri.sv` —
+textured/blended/clipped/rotated triangle lists diffed against
+`refmodel/blt_tri.c`. The reference model itself has grown past this set
+(PALPHA, ADD, MULTIPLY, COLORMOD tint, STAGE, tile/sprite/grid lists,
+PAL8+CLUT — see `docs/blitter-protocol.md`); it stays backward-exact on the
+spike's semantics, which is what this suite pins. The newer semantics are held
+bit-exact by the model's embedded self-test (`refmodel/ make test`), the grid
+equivalence gates (`host/ make test`), and the production fabric's own gating
+testbenches (`tb_blitter_*` in the `solarus-mister` repo), which diff each
+pipeline stage against the same golden functions.
 
 ## What this does / doesn't prove
 
