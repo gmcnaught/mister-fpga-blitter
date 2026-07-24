@@ -377,13 +377,19 @@ uint32_t blt_push_tris(blt_emitter_t *e, const blt_vtx_t *tris, int ntris)
 }
 
 int blt_trilist(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
-                uint16_t colorkey, uint8_t alpha, uint32_t entry_off, int ntris)
+                uint16_t colorkey, uint8_t alpha, uint32_t entry_off, int ntris,
+                uint8_t flags)
 {
-    if (!tex.valid || ntris <= 0) { e->overflow = 1; return -1; }
+    /* BLT_F_SRC_SURFACE draws sample the app-surface render target, not `tex`
+     * (the DDR3/SDRAM texture page) — tex.valid need not hold in that case. */
+    if ((!tex.valid && !(flags & BLT_F_SRC_SURFACE)) || ntris <= 0) {
+        e->overflow = 1; return -1;
+    }
     blt_cmd_t c; memset(&c, 0, sizeof c);
     c.opcode     = BLT_OP_TRILIST;
     c.blend_mode = blend;
     c.format     = tex.format;
+    c.flags      = flags;
     c.src_off    = tex.off;               /* texture page base (source-heap byte off) */
     c.src_stride = tex.stride;            /* texture row stride (bytes)               */
     c.src_x      = tex.w;                 /* texture width  (texels)                  */
@@ -393,6 +399,18 @@ int blt_trilist(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
     c.dst_y      = (int16_t)(entry_off >> 16);          /* entry_off high 16          */
     c.colorkey   = colorkey;
     c.alpha      = alpha;
+    return emit(e, &c);
+}
+
+/* [app-surface render target, step 1] BLT_OP_SET_TARGET: a pure state-set
+ * command, same append path as blt_fill/blt_trilist. cmd.color low byte
+ * carries the target id (BLT_TARGET_WORK / BLT_TARGET_APPSURF); every other
+ * field is zero. */
+int blt_set_target(blt_emitter_t *e, int target_id)
+{
+    blt_cmd_t c; memset(&c, 0, sizeof c);
+    c.opcode = BLT_OP_SET_TARGET;
+    c.color  = (uint16_t)target_id;
     return emit(e, &c);
 }
 

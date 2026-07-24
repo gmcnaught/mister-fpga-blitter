@@ -94,7 +94,7 @@ static inline void blt_unpack_cmd(const uint8_t in[BLT_CMD_BYTES], blt_cmd_t *c)
  *  The triangle list itself lives in a separate vertex entry buffer (blt_vtx_t
  *  triples); the header only points at it and carries the shared draw params:
  *
- *    opcode      = BLT_OP_TRILIST (8)
+ *    opcode      = BLT_OP_TRILIST (10)
  *    blend_mode  = BLT_BLEND_*  (COPY / CONST_ALPHA / ADD / MULTIPLY / COLORKEY)
  *    format      = BLT_FMT_*    (texture page format)
  *    src_off     = texture page base byte offset in the source heap

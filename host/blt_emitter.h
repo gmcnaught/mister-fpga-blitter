@@ -241,8 +241,19 @@ uint32_t blt_push_tris(blt_emitter_t *e, const blt_vtx_t *tris, int ntris);
  * `entry_off` (ntris*3 blt_vtx_t resident in the vertex buffer). Texture-page
  * params (offset/stride/width/height/format) come from `tex`; `w`=ntris,
  * dst_x|dst_y<<16 = entry_off. Returns 0, or -1 + e->overflow on ring full. */
+/* `flags` ORs in per-draw TRILIST flags — currently only BLT_F_SRC_SURFACE
+ * (sample the app-surface render target instead of the DDR3/SDRAM texture
+ * page pointed to by `tex`; `tex`'s fields are then ignored). Pass 0 for the
+ * existing DDR3/SDRAM-sourced behavior (unchanged). */
 int blt_trilist(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
-                uint16_t colorkey, uint8_t alpha, uint32_t entry_off, int ntris);
+                uint16_t colorkey, uint8_t alpha, uint32_t entry_off, int ntris,
+                uint8_t flags);
+
+/* [app-surface render target, step 1] Emit a BLT_OP_SET_TARGET command: switch
+ * the composite write/read target to `target_id` (BLT_TARGET_WORK or
+ * BLT_TARGET_APPSURF) for all subsequent commands in this frame's ring, until
+ * the next blt_set_target call. Returns 0, or -1 + e->overflow on ring full. */
+int blt_set_target(blt_emitter_t *e, int target_id);
 
 #ifdef __cplusplus
 }

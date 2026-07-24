@@ -216,6 +216,18 @@ static void blit_one(uint16_t *fb, const blt_surface_heap_t *heap, const blt_cmd
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
+ *  [app-surface render target, step 1] The off-screen application-surface
+ *  render target BLT_OP_SET_TARGET switches compositing into. Internal to
+ *  this TU (not caller-visible, unlike `fb`) -- matches the RTL's second BRAM
+ *  bank, which likewise has no caller/A9-visible handle. Persists ACROSS
+ *  blt_execute() calls (real hardware: the surface is only re-cleared/redrawn
+ *  when the scene issues fresh draws into it, exactly like `fb` persisting
+ *  across frames is the CALLER's responsibility for the WORK buffer). Sized
+ *  BLT_FB_WIDTH x BLT_FB_HEIGHT per the BLT_TARGET_APPSURF doc comment.
+ * ────────────────────────────────────────────────────────────────────────── */
+static uint16_t appsurf[BLT_FB_PIXELS];
+
+/* ──────────────────────────────────────────────────────────────────────────
  *  blt_execute — walk the command list against a 320x240 RGB565 framebuffer.
  * ────────────────────────────────────────────────────────────────────────── */
 int blt_execute(uint16_t *fb,
@@ -223,12 +235,22 @@ int blt_execute(uint16_t *fb,
                 const blt_cmd_t *cmds,
                 int count) {
     int executed = 0;
+    /* [app-surface render target, step 1] `dst` is the active composite
+     * target, switched by BLT_OP_SET_TARGET; every op below composites into
+     * `dst`, not `fb` directly, so FILL/BLIT/TILELIST(_RES)/TRILIST all
+     * route uniformly. Defaults to `fb` (BLT_TARGET_WORK) -- unchanged
+     * behavior for every existing caller that never emits SET_TARGET. */
+    uint16_t *dst = fb;
     for (int ci = 0; ci < count; ci++) {
         const blt_cmd_t *c = &cmds[ci];
         executed++;
         if (c->opcode == BLT_OP_END)  break;
         if (c->opcode == BLT_OP_NOP)  continue;
         if (c->opcode == BLT_OP_STAGE) continue; /* DDR->SDRAM stage: no FB effect */
+        if (c->opcode == BLT_OP_SET_TARGET) {
+            dst = ((c->color & 0x3u) == BLT_TARGET_APPSURF) ? appsurf : fb;
+            continue;
+        }
 
         /* colour-mod tint (8-bit per channel) carried in the reserved bytes:
          *   _pad[0]=cr  _pad[1]=cg  _pad[2]=cb   (assumed frozen wire placement;
@@ -243,7 +265,7 @@ int blt_execute(uint16_t *fb,
             uint16_t src = do_mod ? blt_tint565(fillc, cr, cg, cb) : fillc;
             for (int j = 0; j < c->h; j++) {
                 for (int i = 0; i < c->w; i++) {
-                    put_blend(fb, c->dst_x + i, c->dst_y + j,
+                    put_blend(dst, c->dst_x + i, c->dst_y + j,
                               src, fillc, c->blend_mode, c->flags,
                               c->colorkey, c->alpha);
                 }
@@ -252,7 +274,7 @@ int blt_execute(uint16_t *fb,
         }
 
         if (c->opcode == BLT_OP_BLIT) {
-            blit_one(fb, heap, c);
+            blit_one(dst, heap, c);
             continue;
         }
 
@@ -271,7 +293,7 @@ int blt_execute(uint16_t *fb,
                 b.opcode = BLT_OP_BLIT;
                 b.src_x=e.src_x; b.src_y=e.src_y; b.w=e.w; b.h=e.h;
                 b.dst_x=(int16_t)(e.dst_x + bias_x); b.dst_y=(int16_t)(e.dst_y + bias_y);
-                blit_one(fb, heap, &b);
+                blit_one(dst, heap, &b);
             }
             continue;
         }
@@ -280,11 +302,13 @@ int blt_execute(uint16_t *fb,
             /* [MFGPU] textured-triangle list. Header dst_x|dst_y<<16 = byte offset
              * of the first vertex in the entry buffer (same entry-offset convention
              * as BLT_OP_TILELIST_RES above); w = triangle count. Vertices are
-             * blt_vtx_t triples resident in the source heap. */
+             * blt_vtx_t triples resident in the source heap. `appsurf` is passed
+             * unconditionally as the potential BLT_F_SRC_SURFACE source -- ignored
+             * unless c->flags requests it. */
             uint32_t entry_off = (uint32_t)(uint16_t)c->dst_x
                                | ((uint32_t)(uint16_t)c->dst_y << 16);
             const blt_vtx_t *tris = (const blt_vtx_t *)(heap->base + entry_off);
-            blt_raster_tri(fb, heap, c, tris, (int)c->w);
+            blt_raster_tri(dst, heap, c, tris, (int)c->w, appsurf);
             continue;
         }
 
@@ -314,7 +338,7 @@ int blt_execute(uint16_t *fb,
                 b.opcode = BLT_OP_BLIT;
                 b.src_x=r.src_x; b.src_y=r.src_y; b.w=r.w; b.h=r.h;
                 b.dst_x=(int16_t)(e.dst_x + bias_x); b.dst_y=(int16_t)(e.dst_y + bias_y);
-                blit_one(fb, heap, &b);
+                blit_one(dst, heap, &b);
             }
             continue;
         }

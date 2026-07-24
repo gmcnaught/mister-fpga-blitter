@@ -45,8 +45,25 @@ static uint16_t tex_nearest(const blt_surface_heap_t *heap, const blt_cmd_t *h,
     return (uint16_t)(p[0] | (p[1]<<8));
 }
 
+/* [app-surface render target, step 1] nearest-texel fetch (RGB565) from the
+ * app-surface buffer instead of the SDRAM heap, when BLT_F_SRC_SURFACE is set.
+ * Same nearest-with-clamp convention as tex_nearest, but clamped to the fixed
+ * BLT_FB_WIDTH x BLT_FB_HEIGHT surface extent (h->src_x/src_y -- the SDRAM
+ * texture's w/h -- are not meaningful here and are not consulted). `surface`
+ * NULL is model-safety only (should not happen once Task 5 wires the real
+ * caller); samples black rather than crash. */
+static uint16_t tex_nearest_surface(const uint16_t *surface, int u_fx, int v_fx){
+    if(!surface) return 0;
+    int tu=(u_fx+HALF)>>SUB, tv=(v_fx+HALF)>>SUB;
+    if(tu<0)tu=0; else if(tu>=BLT_FB_WIDTH)tu=BLT_FB_WIDTH-1;
+    if(tv<0)tv=0; else if(tv>=BLT_FB_HEIGHT)tv=BLT_FB_HEIGHT-1;
+    return surface[tv*BLT_FB_WIDTH+tu];
+}
+
 void blt_raster_tri(uint16_t *fb, const blt_surface_heap_t *heap,
-                    const blt_cmd_t *h, const blt_vtx_t *tris, int ntris){
+                    const blt_cmd_t *h, const blt_vtx_t *tris, int ntris,
+                    const uint16_t *surface){
+    int from_surface = (h->flags & BLT_F_SRC_SURFACE) != 0;
     for(int t=0;t<ntris;t++){
         const blt_vtx_t *a=&tris[t*3+0], *b=&tris[t*3+1], *c=&tris[t*3+2];
         int64_t x0=a->x,y0=a->y, x1=b->x,y1=b->y, x2=c->x,y2=c->y;
@@ -79,7 +96,8 @@ void blt_raster_tri(uint16_t *fb, const blt_surface_heap_t *heap,
                 int cg=(int)divr(w0*((a->rgba>>8)&0xff)+w1*((b->rgba>>8)&0xff)+w2*((c->rgba>>8)&0xff),area);
                 int cb=(int)divr(w0*((a->rgba>>16)&0xff)+w1*((b->rgba>>16)&0xff)+w2*((c->rgba>>16)&0xff),area);
                 int ca=(int)divr(w0*((a->rgba>>24)&0xff)+w1*((b->rgba>>24)&0xff)+w2*((c->rgba>>24)&0xff),area);
-                uint16_t texel=tex_nearest(heap,h,u,v);
+                uint16_t texel=from_surface ? tex_nearest_surface(surface,u,v)
+                                            : tex_nearest(heap,h,u,v);
                 uint16_t src=blt_tint565(texel,(uint8_t)cr,(uint8_t)cg,(uint8_t)cb);
                 uint16_t *dp=&fb[py*BLT_FB_WIDTH+px];
                 int ea=(ca*h->alpha)/255;

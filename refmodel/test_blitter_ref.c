@@ -218,9 +218,87 @@ static void test_end_and_overdraw(void)
     free(fb); free(fb2);
 }
 
+/* [app-surface render target, step 1] Two-pass scene: pass A renders a solid
+ * 8x8 magenta quad into the app-surface at (0,0) (plus an explicit whole-
+ * surface clear first, so the test is deterministic regardless of what any
+ * earlier test in this binary left in the internal `appsurf` buffer -- that
+ * buffer is static/persistent across blt_execute() calls by design, matching
+ * the real hardware's second BRAM bank having no per-call reset). Pass B
+ * (SET_TARGET WORK) draws a fullscreen quad sampling the app-surface with
+ * BLT_F_SRC_SURFACE, BLEND_COPY.
+ *
+ * The fullscreen quad's position AND uv corners use the identical (px<<4,
+ * py<<4) encoding (see blt_tri.c's rasterizer: vertex attributes carry no
+ * implicit pixel-center bias, but the per-pixel sample point does — sx =
+ * (px<<4)|8). Interpolating an attribute that is numerically identical to
+ * position at every vertex reproduces the SAMPLE POINT exactly, so the
+ * fetched texel at destination pixel (px,py) is texel ((px<<4|8 + 8)>>4,
+ * ...) = (px+1, py+1) -- an exact, deterministic +1 texel offset (not a
+ * rounding tie: 16 divides the +8+8=16 remainder cleanly). This is existing,
+ * pre-existing rasterizer behavior (shared with every other textured TRILIST
+ * in this file), not something new to BLT_F_SRC_SURFACE — accounted for
+ * below by placing the magenta quad so screen (0,0) lands on surface texel
+ * (1,1) (inside [0,8)x[0,8)) and screen (0,8) lands on texel (1,9) (outside). */
+static int build_surface_src_scene(blt_cmd_t *cmds, blt_vtx_t *verts) {
+    const uint16_t SURF_CLEAR = 0x0410; /* dark teal-ish; just != magenta */
+    const uint16_t MAGENTA = 0xF81F;    /* rgb565(255,0,255) */
+    int n = 0;
+
+    cmds[n]=(blt_cmd_t){0}; cmds[n].opcode=BLT_OP_SET_TARGET; cmds[n].color=BLT_TARGET_APPSURF; n++;
+    cmds[n]=(blt_cmd_t){0}; cmds[n].opcode=BLT_OP_FILL;
+        cmds[n].dst_x=0; cmds[n].dst_y=0; cmds[n].w=BLT_FB_WIDTH; cmds[n].h=BLT_FB_HEIGHT;
+        cmds[n].color=SURF_CLEAR; n++;
+    cmds[n]=(blt_cmd_t){0}; cmds[n].opcode=BLT_OP_FILL;
+        cmds[n].dst_x=0; cmds[n].dst_y=0; cmds[n].w=8; cmds[n].h=8;
+        cmds[n].color=MAGENTA; n++;
+    cmds[n]=(blt_cmd_t){0}; cmds[n].opcode=BLT_OP_SET_TARGET; cmds[n].color=BLT_TARGET_WORK; n++;
+
+    /* fullscreen quad, position == uv (12.4, texel units, no half-texel bias --
+     * see comment above), 2 triangles, entry_off=0 in the vertex heap. */
+#define SV(px,py) (blt_vtx_t){ (int16_t)((px)<<4), (int16_t)((py)<<4), \
+                               (uint16_t)((px)<<4), (uint16_t)((py)<<4), \
+                               BLT_RGBA(255,255,255,255), 0 }
+    verts[0]=SV(0,0);              verts[1]=SV(BLT_FB_WIDTH,0);            verts[2]=SV(BLT_FB_WIDTH,BLT_FB_HEIGHT);
+    verts[3]=SV(0,0);              verts[4]=SV(BLT_FB_WIDTH,BLT_FB_HEIGHT); verts[5]=SV(0,BLT_FB_HEIGHT);
+#undef SV
+    cmds[n]=(blt_cmd_t){0};
+    cmds[n].opcode=BLT_OP_TRILIST; cmds[n].blend_mode=BLT_BLEND_COPY; cmds[n].format=BLT_FMT_RGB565;
+    cmds[n].flags=BLT_F_SRC_SURFACE; cmds[n].alpha=255;
+    cmds[n].w=2;                                    /* triangle count */
+    cmds[n].dst_x=0; cmds[n].dst_y=0;                /* entry_off = 0, low|high 16 */
+    n++;
+    cmds[n]=(blt_cmd_t){0}; cmds[n].opcode=BLT_OP_END; n++;
+    return n;
+}
+
+static void test_surface_src(void)
+{
+    printf("test_surface_src\n");
+    enum { NCMDS = 6 };
+    blt_cmd_t cmds[NCMDS];
+    blt_vtx_t verts[6];
+    int n = build_surface_src_scene(cmds, verts);
+    CHECK(n == NCMDS, "scene built the expected command count");
+
+    uint8_t heapbuf[6 * sizeof(blt_vtx_t)];
+    memcpy(heapbuf, verts, sizeof heapbuf);
+    blt_surface_heap_t heap = { heapbuf, sizeof heapbuf, NULL, NULL };
+
+    uint16_t *fb = new_fb(0x0000);
+    int executed = blt_execute(fb, &heap, cmds, n);
+    CHECK(executed == NCMDS, "all commands executed (incl. END)");
+
+    uint16_t magenta = 0xF81F, surf_clear = 0x0410;
+    CHECK(PX(fb, 0, 0) == magenta, "surface-sampled pixel (0,0) is magenta");
+    CHECK(PX(fb, 0, 8) != magenta, "row 8 (just outside the 8x8 quad) is not magenta");
+    CHECK(PX(fb, 0, 8) == surf_clear, "row 8 shows the app-surface's own clear color");
+    CHECK(PX(fb, 200, 150) == surf_clear, "far corner also shows the surface clear color");
+    free(fb);
+}
+
 static void test_trilist_layout(void){
     assert(sizeof(blt_vtx_t) == 16);
-    assert(BLT_OP_TRILIST == 8);
+    assert(BLT_OP_TRILIST == 10);
     blt_vtx_t v = { .x=1, .y=2, .u=3, .v=4, .rgba=BLT_RGBA(10,20,30,40), ._rsvd=0 };
     assert((v.rgba & 0xff)==10 && ((v.rgba>>24)&0xff)==40);
     printf("test_trilist_layout OK\n");
@@ -237,6 +315,7 @@ int main(void)
     test_flips();
     test_clipping();
     test_end_and_overdraw();
+    test_surface_src();
     printf("=== %d checks, %d failures ===\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }
