@@ -19,15 +19,15 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* ---- layout (mirror blitter_defs.vh) ----------------------------------- */
-#define FB_W       320
-#define FB_H       240
-#define FB_QWORDS  19200
+/* ---- layout: DERIVED from the blitter_ref.h geometry root ---------------- */
+#define FB_W       BLT_FB_WIDTH
+#define FB_H       BLT_FB_HEIGHT
+#define FB_QWORDS  (BLT_FB_WIDTH * BLT_FB_HEIGHT / 4)
 #define FB0_QW     0u
-#define FB1_QW     19200u
-#define VCTRL_QW   38400u
-#define BLTCTRL_QW 38416u
-#define RING_QW    38432u
+#define FB1_QW     ((unsigned)FB_QWORDS)
+#define VCTRL_QW   ((unsigned)(2 * FB_QWORDS))
+#define BLTCTRL_QW (VCTRL_QW + 16u)
+#define RING_QW    (VCTRL_QW + 32u)
 #define SRC_QW     39000u
 #define MEM_QW     65536u
 #define C_SUBMIT   0u

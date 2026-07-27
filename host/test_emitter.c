@@ -111,10 +111,10 @@ static void test_emitter_vs_handbuilt(void)
           "emitter frame == hand-built frame (bit-exact via refmodel)");
 
     /* spot checks of intent */
-    CHECK(fbA[5*320+5]==0x1111, "fill landed");
-    CHECK(fbA[40*320+50]==A[0], "copy A landed at (50,40)");
-    CHECK(fbA[10*320+10]==0x1111, "colorkey skipped B(0,0) -> underlying fill shows");
-    CHECK(fbA[11*320+11]==0x07E0, "colorkey kept B(1,1) green");
+    CHECK(fbA[5*BLT_FB_WIDTH+5]==0x1111, "fill landed");
+    CHECK(fbA[40*BLT_FB_WIDTH+50]==A[0], "copy A landed at (50,40)");
+    CHECK(fbA[10*BLT_FB_WIDTH+10]==0x1111, "colorkey skipped B(0,0) -> underlying fill shows");
+    CHECK(fbA[11*BLT_FB_WIDTH+11]==0x07E0, "colorkey kept B(1,1) green");
 
     free(fbA); free(fbB); free(ring); free(heap);
 }
@@ -134,7 +134,7 @@ static void test_heap_persistence(void)
         blt_blit_copy(&e, t, f*4, f*4);   /* reuse handle, no re-upload */
         blt_end_frame(&e);
         uint16_t *fb = run_ring(ring, e.cmd_count, heap, e.heap_used, 0);
-        CHECK(fb[(f*4)*320 + f*4]==0xABCD, "reused atlas blits each frame");
+        CHECK(fb[(f*4)*BLT_FB_WIDTH + f*4]==0xABCD, "reused atlas blits each frame");
         free(fb);
     }
     CHECK(e.heap_used == used_after_upload, "heap not grown by reuse (upload-once)");

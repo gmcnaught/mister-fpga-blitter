@@ -34,8 +34,8 @@ extern "C" {
 #endif
 
 /* ---- Fixed framebuffer geometry (v1) ------------------------------------ */
-#define BLT_FB_WIDTH    320
-#define BLT_FB_HEIGHT   240
+#define BLT_FB_WIDTH    288
+#define BLT_FB_HEIGHT   216
 #define BLT_FB_PIXELS   (BLT_FB_WIDTH * BLT_FB_HEIGHT)
 
 /* ---- Opcodes (cmd.opcode) ----------------------------------------------- */
@@ -102,10 +102,9 @@ enum {
  * double-buffer (today's default target, unchanged), 2 = the off-screen
  * application-surface BRAM surface (composite write/read only; never
  * scanned out). [step 1, Task 3] The reference model (blt_execute) sizes
- * the app-surface buffer as a fixed BLT_FB_WIDTH x BLT_FB_HEIGHT (320x240)
- * RGB565 buffer -- a superset of the real used region (<=320x240 per Task 1's
- * measured 288x216) -- to avoid stride/dimension bookkeeping the RTL's fixed
- * BRAM size doesn't need either. */
+ * the app-surface buffer as a fixed BLT_FB_WIDTH x BLT_FB_HEIGHT (288x216)
+ * RGB565 buffer -- exactly the game's real surface size (native-288x216
+ * design, 2026-07-27), so composite and surface share one geometry. */
 #define BLT_TARGET_WORK    0u
 #define BLT_TARGET_APPSURF 2u
 

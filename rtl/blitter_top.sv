@@ -158,19 +158,25 @@ module blitter_top #(
     wire signed [31:0] sy0 = clip_y0 - sdy;   // = ly at (clip_y0)
 
     // ---- dest addressing: REGISTERED INCREMENTAL (timing) -------------------
-    // dst_pidx = dy*320 + dx was a per-pixel 16x16 multiply feeding the dst_qw /
+    // dst_pidx = dy*`FB_W + dx was a per-pixel 16x16 multiply feeding the dst_qw /
     // dst_sh / lane_be / dst_pix_w chain on the dx -> wr_pix critical path. Like
     // the source cursor, it is now maintained by adds: +1 per pixel in a row, and
-    // reset to the row start (+320) per row in S_PIX_ADV. The single base
-    // multiply (y0*320 + x0) is isolated once-per-blit in S_BSETUP / S_FILL setup.
+    // reset to the row start (+`FB_W, see S_PIX_ADV) per row. The single base
+    // multiply (y0*`FB_W + x0) is isolated once-per-blit in S_BSETUP / S_FILL setup.
     reg  [31:0] dst_pidx_r, dst_row_pidx_r;
     wire [31:0] dst_pidx = dst_pidx_r;
     wire [31:0] dst_qw   = target_base + (dst_pidx >> 2);
     wire [5:0]  dst_sh   = {dst_pidx[1:0], 4'b0};
     wire [7:0]  lane_be  = 8'h03 << {dst_pidx[1:0], 1'b0};
     wire [15:0] dst_pix_w = rd_data[dst_sh +: 16];   // registered DDR data (see rd_data)
-    // base index at the clipped origin: dy*320 = (dy<<8)+(dy<<6) shift-add.
-    wire [31:0] dst_base_pidx = (clip_y0<<8) + (clip_y0<<6) + clip_x0;
+    // base index at the clipped origin: dy*`FB_W via shift-add (no multiplier
+    // on this once-per-blit path either, for the same timing reason as above).
+    // `FB_W=288=256+32 -> (dy<<8)+(dy<<5). MUST be re-derived by hand if `FB_W
+    // (blitter_defs.vh) ever changes again -- this decomposition is NOT
+    // parametric. (Native-288x216 contract bump, 2026-07-27; was dy*320 =
+    // (dy<<8)+(dy<<6) before this change -- caught by sim `make test`
+    // fill/copy/colorkey/target1 mismatches since this path bypassed `FB_W.)
+    wire [31:0] dst_base_pidx = (clip_y0<<8) + (clip_y0<<5) + clip_x0;
     // stage-1 dst channel extraction (uses dst_pix_w declared just above)
     wire [4:0]  b_dr  = dst_pix_w[15:11];
     wire [5:0]  b_dg  = dst_pix_w[10:5];
