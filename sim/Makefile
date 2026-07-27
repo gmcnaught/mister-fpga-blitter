@@ -14,6 +14,9 @@ dims-check:
 	ch=$$(sed -n 's/#define BLT_FB_HEIGHT[[:space:]]*\([0-9]*\).*/\1/p' ../refmodel/blitter_ref.h); \
 	vw=$$(sed -n 's/`define FB_W[[:space:]]*\([0-9]*\).*/\1/p' ../rtl/blitter_defs.vh); \
 	vh=$$(sed -n 's/`define FB_H[[:space:]]*\([0-9]*\).*/\1/p' ../rtl/blitter_defs.vh); \
+	if [ -z "$$cw" ] || [ -z "$$ch" ] || [ -z "$$vw" ] || [ -z "$$vh" ]; then \
+	  echo "DIMS: could not extract a root (c=$$cw x $$ch, v=$$vw x $$vh)"; exit 1; \
+	fi; \
 	if [ "$$cw" != "$$vw" ] || [ "$$ch" != "$$vh" ]; then \
 	  echo "DIMS MISMATCH: blitter_ref.h $$cw x $$ch vs blitter_defs.vh $$vw x $$vh"; exit 1; \
 	fi; echo "dims-check OK ($$cw x $$ch)"
