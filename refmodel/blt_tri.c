@@ -38,7 +38,12 @@ static int top_left(int64_t ax,int64_t ay,int64_t bx,int64_t by){
 static uint16_t tex_nearest(const blt_surface_heap_t *heap, const blt_cmd_t *h,
                             int u_fx, int v_fx){
     int tw=h->src_x, th=h->src_y;
-    int tu=(u_fx+HALF)>>SUB, tv=(v_fx+HALF)>>SUB;
+    /* FLOOR, not round: the interpolant is sampled at pixel CENTRES, so it
+     * already carries the +half-pixel of the destination; adding another
+     * +HALF here lands one texel down-right of GL/SW nearest semantics on
+     * every 1:1 corner-UV draw (device-visible as mangled glyph text,
+     * 2026-07-26). Truncation is also one adder cheaper in the RTL. */
+    int tu=u_fx>>SUB, tv=v_fx>>SUB;
     if(tu<0)tu=0; else if(tu>=tw)tu=tw-1;
     if(tv<0)tv=0; else if(tv>=th)tv=th-1;
     const uint8_t *p = heap->base + h->src_off + (uint32_t)tv*h->src_stride + (uint32_t)tu*2u;
@@ -54,7 +59,7 @@ static uint16_t tex_nearest(const blt_surface_heap_t *heap, const blt_cmd_t *h,
  * caller); samples black rather than crash. */
 static uint16_t tex_nearest_surface(const uint16_t *surface, int u_fx, int v_fx){
     if(!surface) return 0;
-    int tu=(u_fx+HALF)>>SUB, tv=(v_fx+HALF)>>SUB;
+    int tu=u_fx>>SUB, tv=v_fx>>SUB;   /* FLOOR — same convention as tex_nearest */
     if(tu<0)tu=0; else if(tu>=BLT_FB_WIDTH)tu=BLT_FB_WIDTH-1;
     if(tv<0)tv=0; else if(tv>=BLT_FB_HEIGHT)tv=BLT_FB_HEIGHT-1;
     return surface[tv*BLT_FB_WIDTH+tu];
