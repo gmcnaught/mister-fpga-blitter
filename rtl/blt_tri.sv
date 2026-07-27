@@ -110,9 +110,15 @@ module blt_tri (
         cca = divr(w0*a0a + w1*a1a + w2*a2a, den);
         cr = ccr[7:0]; cg = ccg[7:0]; cb = ccb[7:0]; ca = cca[7:0];
 
-        // nearest texel with clamp to [0,tex_w-1] x [0,tex_h-1]
-        itu = (uu + 64'sd8) >>> 4;
-        itv = (vv + 64'sd8) >>> 4;
+        // nearest texel with clamp to [0,tex_w-1] x [0,tex_h-1].
+        // FLOOR (plain >>>4), not +8 round: the interpolant is sampled at
+        // pixel centres so it already carries the destination's +half-pixel;
+        // the old +8 landed one texel down-right of GL/SW nearest on every
+        // 1:1 corner-UV draw (device-visible as mangled glyph text,
+        // 2026-07-26). MUST match refmodel blt_tri.c tex_nearest/
+        // tex_nearest_surface. Also drops one 64-bit add from the texel path.
+        itu = uu >>> 4;
+        itv = vv >>> 4;
         tw1 = tex_w - 1; th1 = tex_h - 1;
         if (itu < 0) itu = 0; else if (itu > tw1) itu = tw1;
         if (itv < 0) itv = 0; else if (itv > th1) itv = th1;
