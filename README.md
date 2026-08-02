@@ -129,10 +129,11 @@ The software reference model is the executable spec — it builds and runs with
 no hardware and no dependencies:
 
 ```sh
-cd refmodel && make test   # 34 contract checks + TRILIST goldens + embedded self-test
-cd host     && make test   # 28 emitter/codec checks + self-test + grid gates
-cd libmfgpu && make test   # transform/cull → TRILIST display-list end-to-end
-cd sim      && make test   # RTL ↔ model equivalence, 17 scenarios (iverilog)
+cd refmodel      && make test   # 34 contract checks + TRILIST goldens + embedded self-test
+cd host          && make test   # 28 emitter/codec checks + self-test + grid gates
+cd libmfgpu      && make test   # transform/cull → TRILIST display-list end-to-end
+cd sim           && make test   # RTL ↔ model equivalence, 17 scenarios (iverilog)
+cd prototypes/qt && make test   # UI-offload gates (AA corners, fabric scaling, text)
 ```
 
 `refmodel/blitter_ref.h` is the machine-readable copy of the command contract
@@ -187,10 +188,38 @@ scenarios); not yet deployed in the production solarus-mister fabric. The
 opcodes were renumbered 10→12 / 11→13 when `SPRITELIST`/`TILEMAP` shipped on
 hardware holding 10/11.
 
+## UI front-end offload (`prototypes/qt/`)
+
+The same inversion applied to a **software-rendered UI front-end** rather than a
+game engine: a Qt Quick Software / `QPainter` app (no GPU on the Cyclone V, so
+the A9 rasterizes the whole scene) stops touching pixels and emits a display
+list instead. The present path is unchanged — same DDR double-buffer, same
+doorbell; only the frame's *source* moves to the fabric.
+
+`prototypes/qt/` is a worked example of the two draws a fixed-function blitter
+is usually said to be unable to do, both gated against the golden model:
+
+- **Antialiased rounded corners** — the flat interior is three `FILL`s and each
+  arc is one baked ARGB4444 coverage mask blitted with `HFLIP`/`VFLIP` under
+  `BLT_BLEND_PALPHA`. The mask is colour-free (white RGB, coverage in A4) and
+  gets its colour from `BLT_F_COLORMOD`, bit-exactly matching a `FILL` of the
+  same RGB565 across all 65536 colours. 7 commands, zero A9 pixels.
+- **Arbitrary-ratio image scaling** — exact ratios take the plain `BLIT` fast
+  path; anything else becomes a two-triangle `BLT_OP_TRILIST` quad and the
+  fabric resamples, bit-exactly reproducing nearest-neighbour sampling. One
+  command per draw *at any ratio*, which is what makes a per-frame animated
+  zoom free on the A9 — the case decode-time pre-scaling cannot serve.
+
+Plus a 6×8 bitmap-font glyph atlas, a `QPaintEngine` adapter for the Qt seam
+(not built here — this repo has no Qt dependency), and `make demo`, which
+composites an animated cover-grid menu through the reference model at ~162
+commands/frame. Study: `docs/qt-offload-feasibility.md`.
+
 ## Layout
 
 ```
-docs/          feasibility (go/no-go), protocol spec (the contract), lessons learned
+docs/          feasibility (go/no-go), protocol spec (the contract), lessons learned,
+               Qt front-end offload study
 research-docs/  prior-art survey of existing MiSTer 2D-acceleration cores
 refmodel/      C reference model — golden output for the RTL, exec spec for host
 rtl/           SystemVerilog v1 spike (single-FSM, DDR framebuffer) + the
@@ -200,6 +229,9 @@ host/          host-side command emitter + heap/SDRAM allocators + tilemap
                grid builders (engine-agnostic)
 libmfgpu/      MFGPU geometry front-end: fixed-point transform/cull turning
                triangle batches into TRILIST display lists — see below
+prototypes/qt/ UI front-end offload example: AA rounded corners as baked
+               coverage sprites, arbitrary-ratio scaling as TRILIST quads,
+               6x8 glyph atlas, QPaintEngine seam — see above
 ```
 
 The **production fabric** (pipelined compositor `comp_pipeline.sv`, BRAM WORK
@@ -228,6 +260,8 @@ emitter library that any engine port reuses.
 | Tilemap grid-walk opcode (`TILEMAP`, 8px cell grids + host builders) | ✅ production, HW-validated |
 | 8bpp paletted sources (`PAL8` + on-chip CLUT, halves atlas) | ✅ production, HW-validated |
 | MFGPU triangle front-end (`TRILIST`/`SET_TARGET`, `libmfgpu/`) | 🧪 sim + model validated, not yet deployed |
+| Qt front-end offload study (go/no-go) | ✅ **conditional GO, value-gated** — `docs/qt-offload-feasibility.md` |
+| UI offload example (AA corners + fabric scaling + glyph atlas) | 🧪 model-validated example — `prototypes/qt/` |
 | **On hardware (correct video, zero escapes, Solarus/MiSTer)** | ✅ **validated** — full quest playable |
 | Lessons learned (transport, timing, sizing) | 📓 `docs/lessons-learned.md` |
 

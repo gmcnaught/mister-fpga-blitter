@@ -77,8 +77,10 @@ void blt_raster_tri(uint16_t *fb, const blt_surface_heap_t *heap,
         int64_t hy = (y0>y1?(y0>y2?y0:y2):(y1>y2?y1:y2));
         int minx=(int)(lx>>SUB), maxx=(int)((hx+ONE-1)>>SUB);
         int miny=(int)(ly>>SUB), maxy=(int)((hy+ONE-1)>>SUB);
-        if(minx<0)minx=0; if(miny<0)miny=0;
-        if(maxx>=BLT_FB_WIDTH)maxx=BLT_FB_WIDTH-1; if(maxy>=BLT_FB_HEIGHT)maxy=BLT_FB_HEIGHT-1;
+        if(minx<0)minx=0;
+        if(miny<0)miny=0;
+        if(maxx>=BLT_FB_WIDTH)maxx=BLT_FB_WIDTH-1;
+        if(maxy>=BLT_FB_HEIGHT)maxy=BLT_FB_HEIGHT-1;
         int64_t bias0 = top_left(x1,y1,x2,y2)?0:-1; /* edge opposite vertex a (b->c) */
         int64_t bias1 = top_left(x2,y2,x0,y0)?0:-1; /* opposite b (c->a) */
         int64_t bias2 = top_left(x0,y0,x1,y1)?0:-1; /* opposite c (a->b) */

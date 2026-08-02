@@ -37,3 +37,6 @@ host/test_grid_alloc
 host/test_grid_walk_equiv
 libmfgpu/test_mfgpu
 libmfgpu/test_xform
+prototypes/qt/test_ui_offload
+prototypes/qt/demo_frame
+prototypes/qt/out/

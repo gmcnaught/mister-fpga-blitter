@@ -47,10 +47,14 @@ int mfgpu_submit_batch(mfgpu_t *m, const mfgpu_batch_t *b){
         if (area == 0) continue;
         /* 2D bbox cull vs the viewport [0,vw]x[0,vh] (all 12.4) */
         int32_t minx=a.x, maxx=a.x, miny=a.y, maxy=a.y;
-        if (bb.x<minx)minx=bb.x; if (c.x<minx)minx=c.x;
-        if (bb.x>maxx)maxx=bb.x; if (c.x>maxx)maxx=c.x;
-        if (bb.y<miny)miny=bb.y; if (c.y<miny)miny=c.y;
-        if (bb.y>maxy)maxy=bb.y; if (c.y>maxy)maxy=c.y;
+        if (bb.x<minx)minx=bb.x;
+        if (c.x<minx)minx=c.x;
+        if (bb.x>maxx)maxx=bb.x;
+        if (c.x>maxx)maxx=c.x;
+        if (bb.y<miny)miny=bb.y;
+        if (c.y<miny)miny=c.y;
+        if (bb.y>maxy)maxy=bb.y;
+        if (c.y>maxy)maxy=c.y;
         if (maxx<0 || minx>vw || maxy<0 || miny>vh) continue;
         tris[nsurv*3+0]=a; tris[nsurv*3+1]=bb; tris[nsurv*3+2]=c; nsurv++;
     }
