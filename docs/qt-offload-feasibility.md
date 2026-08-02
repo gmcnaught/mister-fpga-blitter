@@ -6,7 +6,10 @@ path onto the fabric the way `solarus-mister` offloaded SDL compositing?
 **Worked example:** [`prototypes/qt/`](../prototypes/qt/) — a running
 implementation of the two mitigations this document argues for (antialiased
 corners as baked coverage sprites, arbitrary-ratio scaling as `TRILIST` quads),
-gated against the golden reference model.
+gated against the golden reference model. Its demo composites the Zaparoo
+front-end's browse screen with the layout derived from that project's own
+`Theme`/`Sizing`/`Motion`/`Tile` rules, so the shapes and proportions are the
+ones a real front-end actually draws.
 
 ---
 
@@ -127,6 +130,17 @@ The mitigations, each of which is a design constraint rather than a blocker:
   nearest-texel, which is the fidelity trade; the win is that a per-frame
   changing ratio costs one 32-byte command.
   *(Implemented: `uio_image_scaled()`.)*
+
+  **Do not assume the pre-scale is available.** A cover pipeline typically
+  snaps decode sizes to a **tier ladder** (Zaparoo: 128/256/512/768, mirroring
+  what its Core delivers) precisely so the request size equals the decode size
+  and small resolution wobble does not move the tier and force a re-decode. The
+  painted box, meanwhile, comes from the grid solve — 101 px against a 128 px
+  tier at 240p. The two agree only by coincidence, so **a grid of covers is a
+  grid of arbitrary-ratio resamples by design**, and "emit the exact on-screen
+  size instead" is not a free change: it trades the tier ladder's decode-cache
+  stability for the 1:1 blit. Where that trade is not wanted, the triangle path
+  is what is left.
 - **Text → glyph atlas**, if and only if the font is fixed-cell bitmap. Then
   every glyph is a uniform blit out of one atlas, with no distance fields, no
   sub-pixel positioning and no per-glyph raster. A scalable AA font does not

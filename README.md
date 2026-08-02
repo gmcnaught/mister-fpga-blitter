@@ -210,10 +210,13 @@ is usually said to be unable to do, both gated against the golden model:
   command per draw *at any ratio*, which is what makes a per-frame animated
   zoom free on the A9 — the case decode-time pre-scaling cannot serve.
 
-Plus a 6×8 bitmap-font glyph atlas, a `QPaintEngine` adapter for the Qt seam
-(not built here — this repo has no Qt dependency), and `make demo`, which
-composites an animated cover-grid menu through the reference model at ~162
-commands/frame. Study: `docs/qt-offload-feasibility.md`.
+Plus a 6×8 bitmap-font glyph atlas and a `QPaintEngine` adapter for the Qt seam
+(not built here — this repo has no Qt dependency). `make demo` composites the
+**Zaparoo front-end's browse screen**, with the layout derived from that
+project's own `Theme`/`Sizing`/`Motion`/`Tile` rules rather than mocked up: a
+3×2 cover grid whose focused tile animates every frame, then a modal scrim
+fading in over it — the two draws a software renderer struggles with — at a
+peak of 291 commands/frame. Study: `docs/qt-offload-feasibility.md`.
 
 ## Layout
 

@@ -100,7 +100,11 @@ typedef struct {
 } uio_stats_t;
 
 /* ---- context ------------------------------------------------------------ */
-#define UIO_MAX_CORNERS 8      /* cached (radius, alpha) corner masks         */
+/*  Cached (radius, alpha) corner masks. A screen needs one per distinct radius
+ *  it draws — and an animated per-frame scale walks through radii as the shape
+ *  grows, so this is sized for a scaling UI rather than a static one. Each mask
+ *  costs radius^2 * 2 bytes, so the whole cache is a few KiB. */
+#define UIO_MAX_CORNERS 32
 
 typedef struct {
     int      radius;
@@ -180,6 +184,22 @@ int uio_fill(uio_t *u, uio_rect_t r, uint16_t color, uint8_t alpha);
  *  Returns 0, or -1 if a mask could not be baked/uploaded.
  */
 int uio_rounded_rect(uio_t *u, uio_rect_t r, int radius, uint16_t color, uint8_t alpha);
+
+/*  A rounded rect with a uniform outline: an outer rounded rect in
+ *  `ring_color` and an inner one, inset by `thickness`, in `fill_color`.
+ *
+ *  This is not a convenience wrapper invented here — it is the shape the real
+ *  UI already draws. Zaparoo's Tile.qml builds its focus ring from "two stacked
+ *  *filled* rounded rectangles ... significantly smoother on the corners under
+ *  Qt's software adaptation: filled rounded rects honour the AA path, while
+ *  thin rounded *borders* are tessellated without subpixel coverage and step
+ *  visibly at the corners". The same construction is what a fixed-function
+ *  blitter wants, for the same reason: two coverage-masked shapes, no stroking.
+ *
+ *  Emits 14 commands (two rounded rects). Returns 0, or -1.
+ */
+int uio_rounded_rect_outline(uio_t *u, uio_rect_t r, int radius, int thickness,
+                             uint16_t ring_color, uint16_t fill_color, uint8_t alpha);
 
 /* 1:1 image blit (no scaling). `blend` is BLT_BLEND_COPY / COLORKEY / CONST_ALPHA. */
 int uio_image_blit(uio_t *u, uio_image_ref_t img, int dx, int dy,

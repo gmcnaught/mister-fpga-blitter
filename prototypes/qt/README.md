@@ -22,7 +22,7 @@ This directory exists to answer the study's two hardest objections in code:
 ```sh
 cd prototypes/qt
 make test     # the gates below, against the golden reference model
-make demo     # composite 12 animated frames -> out/frame_NN.ppm
+make demo     # composite 24 animated frames -> out/frame_NN.ppm
 ```
 
 No hardware, no dependencies, no Qt. Every display list the layer emits is
@@ -30,19 +30,55 @@ executed by `refmodel/blitter_ref.c` + `refmodel/blt_tri.c` — the same golden
 model the RTL is diffed against — and the resulting framebuffer is compared
 against an independent CPU model of what the draw should have produced.
 
-`make demo` prints a per-frame table and writes PPMs of a cover-grid menu:
-a tiled background, a header bar, eight rounded cover cards with antialiased
-corners, bitmap-font labels, a status pill, and a **focused card whose art is
-re-scaled by the fabric on every frame**.
+## The demo is the real screen, not a mock-up
+
+`make demo` composites the **Zaparoo games-browse screen**, with every
+dimension derived from the front-end's own design rules rather than invented.
+`zaparoo_ui.c` ports them from
+[ZaparooProject/zaparoo-frontend](https://github.com/ZaparooProject/zaparoo-frontend):
+`Theme.qml` (colours, the CRT bitmap font), `Sizing.qml` (`pctH`/`pctW`/
+`fontSize`/`stroke`, corner radius, header metrics, the browse-grid shape
+selector, the cover decode tiers), `Motion.qml` (press duration and scale
+target) and `Tile.qml` (card / focus-ring / caption geometry). Change the
+screen size and the layout re-solves the way the app's would.
+
+Two properties of those rules do the arguing:
+
+```
+  grid shape      : 3 columns x 2 rows (Sizing._selectGridShape)
+  corner radius   : 8 px    tile padding 5, ring 1 px inset 1
+  caption font    : 8 px (fixed-cell 6x8 bitmap face)
+  cover decode    : 128 px tier for a 101 px painted box  -> every cover is
+                    an arbitrary-ratio resample
+```
+
+- On the CRT path `fontSize()` collapses to **8 px** and the font is a
+  fixed-cell 6×8 bitmap face with `NoAntialias` — so every label is a uniform
+  glyph blit. The study's "bitmap-font freebie", straight out of the app's own
+  sizing rule.
+- `gamesGridCoverSourceSize()` snaps a cover's decode size **up to a tier**
+  (128/256/512/768) while the painted box is whatever the grid solve produces
+  (101 px here). They match only by coincidence, so **a grid of covers is a
+  grid of arbitrary-ratio resamples** — which is why "just pre-scale at decode
+  time" does not dispose of the problem.
+
+The demo runs two scenes, both chosen because they are what the software
+renderer struggles with:
+
+| Frames | Scene | Why it's the interesting one |
+|---|---|---|
+| 0–15 | Browse grid, focused tile animating | The focused tile carries the transient push-in cue (`Motion.pressScale` 0.90 over 80 ms) **and** the persistent 1.06 focus scale `Tile.qml` deleted for being "a persistent, per-focus-move cost … on covered grids". Every frame is a different ratio. |
+| 16–23 | A modal scrim fading in over that grid | The draw the team engineered away: a translucent overlay over a dense cover grid forces every cell underneath to re-rasterize, every frame. On the fabric the scrim is **one** const-alpha `FILL` over an already-composited frame. |
 
 ```
 frame  cmds  fills  blits  tris  glyphs   fabric px   A9 px avoided  (fill/AA/scale/text)
-    0   162     32    120     8      76       88344           88344  (60828/1816/23040/2660)
-    6   162     32    120     8      76       89439           89439  (60828/1816/24135/2660)
+    0   223     58    157     6      77      186418          186418  (147516/3244/32963/2695)
+    8   223     58    157     6      77      171303          171303  (134408/3036/31164/2695)
+   23   291     77    206     6     102      316873          316873  (275792/4548/32963/3570)  <- modal scrim
 ```
 
-162 commands ≈ 5 KiB of ring per frame, and the A9 rasterizes nothing —
-including the zoom, whose scale ratio is different on every frame.
+Peak 291 commands ≈ 9 KiB of ring per frame, and the A9 rasterizes nothing —
+including the per-frame scale animation and the scrim.
 
 ## What's in here
 
@@ -51,9 +87,23 @@ including the zoom, whose scale ratio is different on every frame.
 | `ui_offload.{h,c}` | The layer. UI primitives → blitter commands. Pure C, no Qt. |
 | `corner_atlas.{h,c}` | Bakes antialiased quarter-disc coverage into ARGB4444 masks. |
 | `font6x8.{h,c}` | Fixed-cell 6×8 bitmap font → one ARGB4444 glyph atlas. |
+| `zaparoo_ui.{h,c}` | The front-end's Theme/Sizing/Motion/Tile rules, ported to C. |
 | `qt_blitter_paintengine.{h,cpp}` | Seam A: a `QPaintEngine` that translates `QPainter` calls into the layer above. **Not built here** — see below. |
-| `demo_frame.c` | The animated cover-grid frame and its accounting table. |
+| `demo_frame.c` | The browse screen + modal scenes and the accounting table. |
 | `test_ui_offload.c` | The gates. |
+
+### Mapped against the real components
+
+| Front-end element | Offload |
+|---|---|
+| `MainLayout.qml` tiled `bg-circuit.png` (`fillMode: Image.Tile`, `smooth: false`) | one `BLT_OP_TILELIST` for the whole screen |
+| `Tile.qml` card — `surfaceCard` fill + 1 px `borderMid` edge | `uio_rounded_rect_outline()` — 14 commands |
+| `Tile.qml` focus ring — *"two stacked filled rounded rectangles … filled rounded rects honour the AA path, while thin rounded borders are tessellated without subpixel coverage"* | the same construction, `uio_rounded_rect_outline()`. The QML's reason for choosing filled rects over a stroke is exactly the blitter's reason. |
+| `Tile.qml` cover — `PreserveAspectFit` + `smooth: true`, decode tier ≠ painted box | `uio_fit()` + `uio_image_scaled()` → one `TRILIST` quad |
+| `ScrollingCaption` label at `fontSize(2.2)` = 8 px | `uio_text()` — one PALPHA+COLORMOD blit per glyph |
+| `CoreStatusPill.qml` — `radius: half(height)` track + accent progress fill | two `uio_rounded_rect()` pills |
+| `Modal.qml` — `Theme.scrim` `#cc000000` over the screen, `bgPanel` panel, accent-bordered buttons | one const-alpha `FILL` + outlined rounded rects |
+| `MainLayout.qml` whole-scene 90° tate `rotation:` | **not the compositor's job** — `sys/screen_rotate` at the output stage (study §5.2) |
 
 ### The two mechanisms, in one paragraph each
 
@@ -83,6 +133,7 @@ clamp from bleeding a neighbouring atlas entry in.
   rounded rect: 7 commands, gap-free, mirror-symmetric, AA edge
   pill: radius clamped to h/2, ends rounded
   translucent card: opacity baked into coverage, cache keyed on alpha
+  outlined rounded rect: 14 commands, ring thickness exact, corners concentric
   fabric scaling: 10 ratios bit-exact vs nearest-neighbour model
   animated zoom: 1 command/frame at every ratio, vertex arena reset
   unpadded image: scales, and the half-texel compromise is reported
@@ -90,6 +141,7 @@ clamp from bleeding a neighbouring atlas entry in.
   text: 9-glyph run, 1 blit each, colour by COLORMOD from one atlas
   aspect fit: PreserveAspectFit boxes centred and integral
   frame budget: 97 commands for 8 cards, 74592 px moved to the fabric
+  zaparoo layout: 3x2 grid, r=8, 8px bitmap font, 128 px cover -> 101 px box
 ```
 
 Two ratios are pinned at a one-texel tolerance rather than bit-exactness: a
@@ -136,8 +188,13 @@ that.
 - **The geometry is the model's 320×240 RGB565.** The study targets 352×240
   first and reaches 480i through a banded write-through WORK cache — a
   fabric-side change that does not alter the display list this layer emits.
-- **The font is a demo face.** A real port bakes its own fixed-cell font
-  (e.g. MxPlus HP 100LX 6×8) into the same atlas shape; nothing else changes.
+- **The font is a demo face.** The real CRT path uses MxPlus HP 100LX 6×8; a
+  port bakes that TTF into the same atlas shape and nothing else changes. The
+  glyph shapes here are stand-ins, and so is the procedurally generated art.
+- **The layout rules are ported, the widgets are not.** `zaparoo_ui.c`
+  reproduces the sizing/theme/motion tokens so the demo has the real screen's
+  proportions; it is not a port of the QML components, and the upstream project
+  (PolyForm-Noncommercial) contributes no code here.
 - **Sources are read from the DDR heap, not staged into SDRAM.** On hardware,
   the load-time uploads would additionally be staged with
   `blt_stage_surface_perm()`; the reference model reads the heap directly, so

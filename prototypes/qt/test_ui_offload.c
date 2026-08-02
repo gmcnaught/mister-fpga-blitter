@@ -16,6 +16,7 @@
  *  GPL-3.0.
  */
 #include "ui_offload.h"
+#include "zaparoo_ui.h"
 #include "blt_wire.h"
 #include <assert.h>
 #include <stdio.h>
@@ -257,6 +258,50 @@ static void test_rounded_rect_alpha(void)
     uio_end_frame(&v.u);
     CHECK(v.u.ncorners == 2, "(radius,alpha) cache collapsed distinct alphas");
     printf("  translucent card: opacity baked into coverage, cache keyed on alpha\n");
+    env_free(&v);
+}
+
+/*  The outlined rounded rect — Zaparoo's Tile.qml builds both the card edge and
+ *  the focus ring out of two stacked FILLED rounded rects rather than a stroked
+ *  border, because Qt's software adaptation antialiases fills but tessellates
+ *  thin rounded borders. The blitter wants exactly the same construction. */
+static void test_rounded_rect_outline(void)
+{
+    env_t v; env_init(&v);
+    const uint16_t BG = blt_rgb565(0, 0, 0);
+    const uint16_t RING = blt_rgb565(255, 179, 71);      /* Theme.accent      */
+    const uint16_t FILL = blt_rgb565(34, 34, 58);        /* Theme.surfaceCard */
+    const uio_rect_t R = { 30, 30, 100, 70 };
+    const int RAD = 10, TH = 3;
+
+    uio_begin_frame(&v.u, 0, 0, 0);
+    CHECK(uio_rounded_rect_outline(&v.u, R, RAD, TH, RING, FILL, 255) == 0, "outline failed");
+    uio_end_frame(&v.u);
+    CHECK(v.u.stats.rounded_rects == 2, "outline should be 2 rounded rects, got %u",
+          v.u.stats.rounded_rects);
+    CHECK(v.u.stats.cmds == 15, "expected 14 commands + END, got %u", v.u.stats.cmds);
+
+    fb_clear(&v, BG);
+    env_run(&v);
+
+    /* mid-edge samples: ring on the outside, fill inside, background beyond */
+    int midx = R.x + R.w / 2, midy = R.y + R.h / 2;
+    CHECK(px(&v, midx, R.y - 1) == BG, "painted above the rect");
+    CHECK(px(&v, midx, R.y) == RING, "top edge not the ring colour");
+    CHECK(px(&v, midx, R.y + TH - 1) == RING, "ring thinner than %d px", TH);
+    CHECK(px(&v, midx, R.y + TH) == FILL, "interior not punched back at %d px", TH);
+    CHECK(px(&v, R.x + TH - 1, midy) == RING, "left ring wrong");
+    CHECK(px(&v, R.x + TH, midy) == FILL, "left interior wrong");
+    CHECK(px(&v, R.x + R.w - TH, midy) == RING, "right ring wrong");
+    CHECK(px(&v, midx, midy) == FILL, "centre not the fill colour");
+
+    /* A ring thicker than the rect stays a solid rounded rect, not garbage. */
+    uio_begin_frame(&v.u, 0, 0, 0);
+    CHECK(uio_rounded_rect_outline(&v.u, (uio_rect_t){ 0, 0, 10, 10 }, 4, 20,
+                                   RING, FILL, 255) == 0, "degenerate outline failed");
+    uio_end_frame(&v.u);
+    CHECK(v.u.stats.rounded_rects == 1, "degenerate outline drew an inner rect");
+    printf("  outlined rounded rect: 14 commands, ring thickness exact, corners concentric\n");
     env_free(&v);
 }
 
@@ -588,6 +633,74 @@ static void test_frame_budget(void)
     env_free(&v);
 }
 
+/* ── 8. the ported Zaparoo layout rules ─────────────────────────────────── */
+/*
+ *  The demo's fidelity rests on zaparoo_ui.c reproducing the app's own sizing
+ *  rules, so pin the values they produce on the CRT path at the model's
+ *  320x240. The last one is the load-bearing number for the whole scaling
+ *  argument: the cover DECODE size is snapped up to a tier while the PAINTED
+ *  box comes from the grid solve, so a grid of covers is a grid of
+ *  arbitrary-ratio resamples — not something a decode-time pre-scale removes.
+ */
+static void test_zaparoo_layout(void)
+{
+    const zui_sizing_t crt = { 320, 240, 1 };
+
+    CHECK(zui_565(0xFFB347u) == blt_rgb565(255, 179, 71), "accent conversion wrong");
+    CHECK(zui_565(0x000000u) == 0 && zui_565(0xFFFFFFu) == 0xFFFF, "hex endpoints wrong");
+
+    /* Math.round semantics: JS rounds .5 up, C's round() rounds away from zero
+     * — the percentage helpers land on .5 constantly, so this must match. */
+    CHECK(zui_pctH(&crt, 3.5) == 8, "cornerRadius pctH(3.5) got %d", zui_pctH(&crt, 3.5));
+    CHECK(zui_pctH(&crt, 0.8) == 2, "pctH(0.8) got %d", zui_pctH(&crt, 0.8));
+    CHECK(zui_pctH(&crt, 5.5) == 13, "captionHeight got %d", zui_pctH(&crt, 5.5));
+    CHECK(zui_pctW(&crt, 2) == 6, "headerSideMargin got %d", zui_pctW(&crt, 2));
+
+    /* fontSize floors at 8 and the CRT path quantises to the bitmap face. */
+    CHECK(zui_font_size(&crt, 2.2) == 8, "caption font got %d", zui_font_size(&crt, 2.2));
+    CHECK(zui_font_size(&crt, 3.4) == 8, "header row got %d", zui_font_size(&crt, 3.4));
+    CHECK(zui_font_size(&crt, 2.2) == UIO_FONT_CELL_H,
+          "CRT font size no longer matches the 6x8 atlas cell");
+    const zui_sizing_t hd = { 1920, 1080, 0 };
+    CHECK(zui_font_size(&hd, 2.2) == 24, "desktop font got %d", zui_font_size(&hd, 2.2));
+    CHECK(zui_font_size(&crt, 8) == 16, "CRT quantisation to 16 broken");
+
+    CHECK(zui_header_height(&crt) == 18, "headerHeight got %d", zui_header_height(&crt));
+    CHECK(zui_header_bottom(&crt) == 23, "headerBottom got %d", zui_header_bottom(&crt));
+
+    /* The grid solve: at 240p only 2 rows clear minCellHeight, and 3 columns
+     * beat 2 because the cell aspect lands nearer the 0.78 box-art target. */
+    int cols = 0, rows = 0;
+    zui_games_grid_shape(&crt, &cols, &rows);
+    CHECK(cols == 3 && rows == 2, "games grid got %dx%d, expected 3x2", cols, rows);
+    zui_systems_grid_shape(&crt, &cols, &rows);
+    CHECK(cols >= 2 && cols <= 3 && rows >= 2 && rows <= 3,
+          "systems grid out of CRT bounds (%dx%d)", cols, rows);
+    zui_games_grid_shape(&hd, &cols, &rows);
+    CHECK(cols >= 2 && cols <= 5 && rows >= 2 && rows <= 5,
+          "desktop grid out of bounds (%dx%d)", cols, rows);
+
+    CHECK(zui_snap_cover_tier(1) == 128 && zui_snap_cover_tier(128) == 128, "tier 128");
+    CHECK(zui_snap_cover_tier(129) == 256 && zui_snap_cover_tier(900) == 768, "tier ladder");
+
+    int box = zui_games_grid_cover_box(&crt);
+    int tier = zui_games_grid_cover_source_size(&crt);
+    CHECK(box == 101, "cover box got %d, expected 101", box);
+    CHECK(tier == 128, "cover tier got %d, expected 128", tier);
+    CHECK(tier != box, "decode tier == painted box: the resample argument would be moot");
+
+    zui_tile_t tm;
+    zui_tile_metrics(&crt, &tm);
+    CHECK(tm.corner_radius == 8 && tm.padding == 5 && tm.caption_height == 13,
+          "tile metrics got r=%d pad=%d cap=%d", tm.corner_radius, tm.padding, tm.caption_height);
+    CHECK(tm.outline_gap == 1 && tm.outline_width == 1 && tm.border_width == 1,
+          "tile strokes got gap=%d ring=%d border=%d",
+          tm.outline_gap, tm.outline_width, tm.border_width);
+    CHECK(tm.corner_radius <= UIO_CORNER_MAX_RADIUS, "radius exceeds the corner baker");
+    printf("  zaparoo layout: 3x2 grid, r=%d, 8px bitmap font, %d px cover -> %d px box\n",
+           tm.corner_radius, tier, box);
+}
+
 int main(void)
 {
     printf("test_ui_offload — Qt front-end offload gates\n");
@@ -596,6 +709,7 @@ int main(void)
     test_rounded_rect();
     test_rounded_rect_pill();
     test_rounded_rect_alpha();
+    test_rounded_rect_outline();
     test_scaling();
     test_scaling_cost_is_constant();
     test_unpadded_is_reported();
@@ -603,6 +717,7 @@ int main(void)
     test_text();
     test_fit();
     test_frame_budget();
+    test_zaparoo_layout();
     if (failures) { printf("%d FAILURE(S)\n", failures); return 1; }
     printf("all gates pass\n");
     return 0;

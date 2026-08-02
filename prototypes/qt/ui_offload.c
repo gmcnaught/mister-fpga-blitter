@@ -195,6 +195,24 @@ int uio_rounded_rect(uio_t *u, uio_rect_t r, int radius, uint16_t color, uint8_t
     return 0;
 }
 
+int uio_rounded_rect_outline(uio_t *u, uio_rect_t r, int radius, int thickness,
+                             uint16_t ring_color, uint16_t fill_color, uint8_t alpha)
+{
+    if (!u || !u->e || thickness <= 0) return -1;
+    if (uio_rounded_rect(u, r, radius, ring_color, alpha) != 0) return -1;
+
+    uio_rect_t inner = { r.x + thickness, r.y + thickness,
+                         r.w - 2 * thickness, r.h - 2 * thickness };
+    if (inner.w <= 0 || inner.h <= 0) return 0;          /* the ring is solid */
+
+    /* Concentric corners: the inner radius shrinks by the ring thickness, and
+     * floors at 0 so a thick ring on a small rect collapses to a sharp inner
+     * mask rather than negative-radius garbage (Tile.qml does the same). */
+    int inner_radius = radius - thickness;
+    if (inner_radius < 0) inner_radius = 0;
+    return uio_rounded_rect(u, inner, inner_radius, fill_color, alpha);
+}
+
 int uio_image_blit(uio_t *u, uio_image_ref_t img, int dx, int dy,
                    uint8_t blend, uint16_t colorkey, uint8_t alpha)
 {
