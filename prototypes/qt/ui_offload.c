@@ -19,12 +19,26 @@ static void note_err(uio_t *u, int err) { if (err && !u->last_error) u->last_err
 /* ────────────────────────────────────────────────────────────────────────
  *  Lifecycle
  * ──────────────────────────────────────────────────────────────────────── */
-int uio_init(uio_t *u, blt_emitter_t *e, void *src_base, uint32_t vtx_bytes)
+int uio_init(uio_t *u, blt_emitter_t *e, void *src_base, uint32_t vtx_bytes,
+             uint32_t sprite_bytes)
 {
     if (!u || !e || !src_base || vtx_bytes == 0) return -1;
     memset(u, 0, sizeof *u);
     u->e = e;
     u->src_base = (uint8_t *)src_base;
+
+    /*  The sprite arena goes FIRST because it must start at heap offset 0: the
+     *  sprite channel builds entry offsets relative to the arena base, while
+     *  the fabric (and blt_execute) resolve a SPRITELIST header's entry offset
+     *  against the heap base. Anywhere else and a batched glyph run would read
+     *  its entries from the wrong bytes. */
+    if (sprite_bytes) {
+        uint32_t sp_off = blt_alloc(&e->alloc, sprite_bytes);
+        if (sp_off == BLT_ALLOC_FAIL) return -1;
+        if (sp_off != 0) return -1;              /* heap was not virgin */
+        u->sp_bytes = sprite_bytes;
+        blt_sprite_list_init(e, u->src_base, sprite_bytes);
+    }
 
     /* The vertex arena is allocated FROM the source heap so a TRILIST header's
      * entry offset (resolved against the heap base) is valid, and so uploads

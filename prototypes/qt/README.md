@@ -16,13 +16,14 @@ This directory exists to answer the study's two hardest objections in code:
 |---|---|
 | "Antialiased rounded corners are on ~every surface and don't map to a fixed-function blitter." | `uio_rounded_rect()` — 3 `FILL`s for the flat interior, plus **one baked ARGB4444 coverage mask blitted four times** (`HFLIP`/`VFLIP`) under `BLT_BLEND_PALPHA`. 7 commands, zero A9 pixels. |
 | "Arbitrary-ratio cover scaling is nearest-texel or nothing." | `uio_image_scaled()` — exact ratios take the cheap `BLIT` path; **any other ratio becomes a two-triangle `BLT_OP_TRILIST` quad and the fabric resamples**. 1 command, at any ratio, changing every frame. |
+| "Only a fixed-cell bitmap font maps; real text doesn't." | `glyph_cache.{h,c}` — the A9 rasterizes each glyph **once** into a colour-free `PAL8` coverage atlas; colour is a CLUT ramp, and a `SPRITELIST` entry's own palette word puts a whole mixed-colour screen in **one command**. |
 
 ## Build and run
 
 ```sh
 cd prototypes/qt
 make test     # the gates below, against the golden reference model
-make demo     # composite 24 animated frames -> out/frame_NN.ppm
+make demo     # composite 32 animated frames -> out/frame_NN.ppm
 ```
 
 No hardware, no dependencies, no Qt. Every display list the layer emits is
@@ -62,23 +63,29 @@ Two properties of those rules do the arguing:
   grid of arbitrary-ratio resamples** — which is why "just pre-scale at decode
   time" does not dispose of the problem.
 
-The demo runs two scenes, both chosen because they are what the software
+The demo runs three scenes, chosen because they are what the software
 renderer struggles with:
 
 | Frames | Scene | Why it's the interesting one |
 |---|---|---|
 | 0–15 | Browse grid, focused tile animating | The focused tile carries the transient push-in cue (`Motion.pressScale` 0.90 over 80 ms) **and** the persistent 1.06 focus scale `Tile.qml` deleted for being "a persistent, per-focus-move cost … on covered grids". Every frame is a different ratio. |
 | 16–23 | A modal scrim fading in over that grid | The draw the team engineered away: a translucent overlay over a dense cover grid forces every cell underneath to re-rasterize, every frame. On the fabric the scrim is **one** const-alpha `FILL` over an already-composited frame. |
+| 24–31 | A detail pane drawn with **general** text | Proportional antialiased type at three sizes in four colours, with the title marqueeing at a quarter-pixel per frame. 111 glyphs, **one** `SPRITELIST` command, and zero A9 raster once the cache is warm. |
 
 ```
-frame  cmds  fills  blits  tris  glyphs   fabric px   A9 px avoided  (fill/AA/scale/text)
-    0   223     58    157     6      77      186418          186418  (147516/3244/32963/2695)
-    8   223     58    157     6      77      171303          171303  (134408/3036/31164/2695)
-   23   291     77    206     6     102      316873          316873  (275792/4548/32963/3570)  <- modal scrim
+frame  cmds  fills  blits  tris  glyphs  rast   fabric px   A9 px avoided  (fill/AA/scale/text)
+    0   223     58    157     6      77     0      186418          186418  (147516/3244/32963/2695)
+    8   223     58    157     6      77     0      171303          171303  (134408/3036/31164/2695)
+   23   291     77    206     6     102     0      316873          316873  (275792/4548/32963/3570)  <- modal scrim
+   24    80     22     52     1     111    47      139883          139883  (124142/644/7252/7845)  <- detail pane, general text
+   31    78     22     52     1     111     0      139942          139942  (124214/644/7252/7832)  <- detail pane, general text
 ```
 
 Peak 291 commands ≈ 9 KiB of ring per frame, and the A9 rasterizes nothing —
-including the per-frame scale animation and the scrim.
+including the per-frame scale animation, the scrim, and (after the first frame
+of the detail pane) the text. `rast` is the only column where A9 pixel work
+appears at all: 47 glyphs on the pane's first frame, then 12/frame while the
+marquee walks through its four subpixel phases, then zero.
 
 ## What's in here
 
@@ -86,7 +93,9 @@ including the per-frame scale animation and the scrim.
 |---|---|
 | `ui_offload.{h,c}` | The layer. UI primitives → blitter commands. Pure C, no Qt. |
 | `corner_atlas.{h,c}` | Bakes antialiased quarter-disc coverage into ARGB4444 masks. |
-| `font6x8.{h,c}` | Fixed-cell 6×8 bitmap font → one ARGB4444 glyph atlas. |
+| `font6x8.{h,c}` | Fixed-cell 6×8 bitmap font → one ARGB4444 glyph atlas (the CRT path). |
+| `glyph_cache.{h,c}` | General text: coverage atlas + LRU cache + CLUT colour ramps + `SPRITELIST` batching. |
+| `font_stroke.{h,c}` | A scalable stand-in rasterizer, so the cache path runs with no font library. |
 | `zaparoo_ui.{h,c}` | The front-end's Theme/Sizing/Motion/Tile rules, ported to C. |
 | `qt_blitter_paintengine.{h,cpp}` | Seam A: a `QPaintEngine` that translates `QPainter` calls into the layer above. **Not built here** — see below. |
 | `demo_frame.c` | The browse screen + modal scenes and the accounting table. |
@@ -104,6 +113,35 @@ including the per-frame scale animation and the scrim.
 | `CoreStatusPill.qml` — `radius: half(height)` track + accent progress fill | two `uio_rounded_rect()` pills |
 | `Modal.qml` — `Theme.scrim` `#cc000000` over the screen, `bgPanel` panel, accent-bordered buttons | one const-alpha `FILL` + outlined rounded rects |
 | `MainLayout.qml` whole-scene 90° tate `rotation:` | **not the compositor's job** — `sys/screen_rotate` at the output stage (study §5.2) |
+
+### Generalised text
+
+The 6×8 path only covers the CRT case — one size, one advance, no AA. The
+general path (`glyph_cache.h`) starts from the observation that **the fabric
+never has to rasterize text in order to draw it**: an outline is rasterized
+once, by the A9, at the size it is first seen, and every frame after that is a
+blit of a cached coverage bitmap. Three mechanisms make that composite:
+
+- **AA → alpha.** Coverage lives in the source's alpha, exactly like the corner
+  masks, and `BLT_BLEND_PALPHA` composites it.
+- **Colour → the CLUT.** A texel *is* a coverage level: a `PAL8` glyph resolves
+  through a 16-entry ramp whose entries share one RGB565 with alpha climbing
+  0..15. One atlas serves every colour at 1 byte per texel, and the fully
+  covered entry composites bit-identically to a `FILL` of that colour.
+- **Per-frame cost → `SPRITELIST`.** Each entry carries its own palette word,
+  so mixed-colour text still flushes as a single command. The gates check the
+  batched output is pixel-identical to the per-glyph path.
+
+Limits, all measured rather than asserted: **16 coverage levels** (A4 is the
+alpha width every per-pixel-alpha source in this contract has — worth ≤8/255 of
+alpha, ≤1 step of a 5-bit channel after the blend); **animated text size never
+amortises** (every size is a fresh raster, and `TRILIST` can't rescale a glyph
+because it samples no alpha); **subpixel phases multiply cache entries by N**;
+and an over-subscribed atlas **refuses** glyphs rather than overwriting texels
+the fabric may still be reading, so `fa.refused` is a number an app has to
+watch. `font_stroke.c` is a stand-in rasterizer — a real port passes
+FreeType's `FT_Render_Glyph` or Qt's `QRawFont::alphaMapForGlyph` through the
+same callback.
 
 ### The two mechanisms, in one paragraph each
 
@@ -141,6 +179,13 @@ clamp from bleeding a neighbouring atlas entry in.
   text: 9-glyph run, 1 blit each, colour by COLORMOD from one atlas
   aspect fit: PreserveAspectFit boxes centred and integral
   frame budget: 97 commands for 8 cards, 74592 px moved to the fabric
+  text ramp: full coverage == FILL, level 0 skip-writes, banks spill
+  coverage quantisation: <=8/255 alpha, <=1 of 31 red steps
+  stroke font: proportional, antialiased, scalable (stand-in rasterizer)
+  glyph cache: 22 distinct glyphs rasterized once, warm frames raster nothing
+  glyph batching: 30 mixed-colour glyphs -> 3 commands/frame (33 unbatched), pixel-identical
+  glyph eviction: 7 evictions once glyphs age out, 83 refusals while the working set is pinned
+  subpixel phases: fractional pen positions cache separately
   zaparoo layout: 3x2 grid, r=8, 8px bitmap font, 128 px cover -> 101 px box
 ```
 
@@ -164,6 +209,7 @@ widget/QML split to bridge.
 | `drawImage` / `drawPixmap`, 1:1 | `uio_image_blit` → `BLIT` |
 | `drawImage` / `drawPixmap`, scaled | `uio_image_scaled` → `TRILIST` quad |
 | `drawTextItem`, fixed bitmap font | `uio_text` → PALPHA + COLORMOD glyph blits |
+| `drawTextItem`, any other font | `uio_text_run` → glyph cache (rasterize once, then blits) |
 | anything else | rasterized on the A9, uploaded, blitted — **and counted** |
 
 It is **not compiled by this Makefile**: the repository has no Qt dependency.

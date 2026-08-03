@@ -210,8 +210,15 @@ is usually said to be unable to do, both gated against the golden model:
   command per draw *at any ratio*, which is what makes a per-frame animated
   zoom free on the A9 — the case decode-time pre-scaling cannot serve.
 
-Plus a 6×8 bitmap-font glyph atlas and a `QPaintEngine` adapter for the Qt seam
-(not built here — this repo has no Qt dependency). `make demo` composites the
+It also generalises text. A fixed 6×8 bitmap face atlases trivially, but
+proportional antialiased text composites on the fabric too: the A9 rasterizes
+each glyph **once** into a colour-free `PAL8` coverage atlas (a texel *is* a
+coverage level), colour comes from a 16-entry CLUT ramp so one atlas serves
+every colour, and because a `SPRITELIST` entry carries its own palette word an
+entire screen of mixed-colour text is **one command**. In the demo's detail
+pane that is 111 glyphs at three sizes in four colours, with zero A9 raster
+once the cache is warm. Plus a `QPaintEngine` adapter for the Qt seam (not
+built here — this repo has no Qt dependency). `make demo` composites the
 **Zaparoo front-end's browse screen**, with the layout derived from that
 project's own `Theme`/`Sizing`/`Motion`/`Tile` rules rather than mocked up: a
 3×2 cover grid whose focused tile animates every frame, then a modal scrim

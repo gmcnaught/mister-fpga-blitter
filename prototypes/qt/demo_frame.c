@@ -7,8 +7,8 @@
  *  way the app's would — including the grid shape, which the app picks by
  *  scoring cell aspect against a target.
  *
- *  Two scenes, both chosen because they are the draws the real UI struggles
- *  with on the A9:
+ *  Three scenes, chosen because they are the draws the real UI struggles with
+ *  on the A9:
  *
  *  1. BROWSE — a grid of cover cards. Each card is a rounded rect with an
  *     antialiased edge, and each cover is a decode-tier bitmap (128 px) painted
@@ -25,12 +25,20 @@
  *     fabric the scrim is ONE const-alpha FILL over an already-composited
  *     frame, and the grid beneath it costs what it always cost.
  *
+ *  3. DETAIL — a pane drawn with GENERAL text: proportional, antialiased type
+ *     at three sizes in four colours, out of one colour-free PAL8 coverage
+ *     atlas (glyph_cache.h), with the title marqueeing at a quarter-pixel per
+ *     frame. The A9 rasterizes each glyph once; every frame after that the
+ *     whole pane's text is a single SPRITELIST command.
+ *
  *    make demo    -> out/frame_NN.ppm + a per-frame command/pixel table
  *
  *  GPL-3.0.
  */
 #include "ui_offload.h"
 #include "zaparoo_ui.h"
+#include "glyph_cache.h"
+#include "font_stroke.h"
 #include "blt_wire.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,10 +48,19 @@
 #define RING_BYTES (256u * 1024u)
 #define SRC_BYTES  (4u * 1024u * 1024u)
 #define VTX_BYTES  (32u * 1024u)
+#define SP_BYTES   (256u * 1024u)
 
 #define BROWSE_FRAMES 16
 #define MODAL_FRAMES   8
-#define FRAMES        (BROWSE_FRAMES + MODAL_FRAMES)
+#define DETAIL_FRAMES  8
+#define FRAMES        (BROWSE_FRAMES + MODAL_FRAMES + DETAIL_FRAMES)
+
+/* General-text resources (glyph_cache.h): a PAL8 coverage atlas + its cache
+ * directory + the sprite arena the batch flushes through. */
+#define GLYPH_SLOTS   512
+#define ATLAS_W       384
+#define ATLAS_H       192
+#define TEXT_PHASES   4          /* subpixel phases -> smooth horizontal motion */
 
 /*  The reference model's framebuffer is 320x240 RGB565. The app's CRT modes are
  *  352x240 / 352x288 / 720x480 at 32bpp (native_video_writer's mode table); the
@@ -125,6 +142,12 @@ typedef struct {
     uio_image_ref_t   cover[TILE_COUNT];
     zui_tile_t        tm;
     int               columns, rows;
+
+    /* general text */
+    uio_glyph_atlas_t     fa;
+    uio_stroke_font_t     font;
+    blt_sprite_channel_t  chan;
+    uint32_t              last_misses;
 } scene_t;
 
 static const char *const TITLES[TILE_COUNT] = {
@@ -300,6 +323,63 @@ static void emit_modal(scene_t *s, int scrim_alpha)
              accept.y + (bh - UIO_FONT_INK_H) / 2, "PLAY", zui_565(ZUI_TEXT_PRIMARY));
 }
 
+/*  Scene 3: a game-detail pane drawn with GENERAL text — a proportional,
+ *  antialiased, scalable face at three sizes, in three colours, from ONE
+ *  colour-free PAL8 coverage atlas, batched into a single SPRITELIST command.
+ *
+ *  The title marquees at a quarter-pixel per frame, which is the case a
+ *  fixed-cell bitmap font cannot serve: ScrollingCaption.qml steps its marquee
+ *  with a Timer rather than a fractional animation precisely because the CRT
+ *  path's font has no subpixel positions. With phases > 1 the cache holds each
+ *  phase separately, so the run lands between pixels and the motion is smooth.
+ */
+static void emit_detail(scene_t *s, int step)
+{
+    uio_t *u = s->u;
+    const int radius = zui_corner_radius(&SZ);
+    uio_rect_t panel = { 8, zui_header_bottom(&SZ) + 2,
+                         BLT_FB_WIDTH - 16, BLT_FB_HEIGHT - zui_header_bottom(&SZ) - 12 };
+    uio_rounded_rect_outline(u, panel, radius, 1,
+                             zui_565(ZUI_BORDER_MID), zui_565(ZUI_BG_PANEL), 255);
+
+    /* the detail cover: a decode tier scaled to the pane's art box */
+    uio_image_ref_t art = s->cover[1];
+    uio_rect_t box = { panel.x + 8, panel.y + 8, 74, panel.h - 16 };
+    uio_scale_t sc;
+    memset(&sc, 0, sizeof sc);
+    sc.dst = uio_fit(box, art.w, art.h);
+    sc.blend = BLT_BLEND_COPY;
+    sc.alpha = 255;
+    uio_image_scaled(u, art, &sc);
+
+    const int tx = panel.x + 92;
+    int baseline = panel.y + 22;
+
+    /*  Every glyph below goes through the same batch, so the whole pane's text
+     *  — three sizes, three colours — costs one command. */
+    uio_text_batch_begin(u, &s->chan);
+
+    /* marquee: a quarter pixel per frame, wrapping inside the pane */
+    int scroll_fx = -(step * 64) % (24 << 8);
+    uio_text_run_fx(u, &s->fa, 18, (tx << 8) + scroll_fx, baseline,
+                    "Streets of Rage 2", zui_565(ZUI_ACCENT));
+
+    baseline += 20;
+    uio_text_run(u, &s->fa, 11, tx, baseline, "Mega Drive  1992  SEGA",
+                 zui_565(ZUI_TEXT_VARIANT));
+    baseline += 15;
+    uio_text_run(u, &s->fa, 11, tx, baseline, "Played 12h 40m", zui_565(ZUI_TEXT_LABEL));
+    baseline += 22;
+    uio_text_run(u, &s->fa, 11, tx, baseline, "Axel, Blaze and Max take", zui_565(ZUI_TEXT_PRIMARY));
+    baseline += 14;
+    uio_text_run(u, &s->fa, 11, tx, baseline, "back the city, one block", zui_565(ZUI_TEXT_PRIMARY));
+    baseline += 14;
+    uio_text_run(u, &s->fa, 11, tx, baseline, "at a time.", zui_565(ZUI_TEXT_PRIMARY));
+
+    int runs = uio_text_batch_flush(u);
+    (void)runs;
+}
+
 /*  The focused tile's scale for this frame.
  *
  *  Frames 0-3   rest at the restored persistent focus scale (1.06),
@@ -321,12 +401,23 @@ static void emit_frame(scene_t *s, int frame)
 {
     uio_t *u = s->u;
     uio_begin_frame(u, frame & 1, 1, zui_565(ZUI_BG_DEEP));
+    uio_glyph_atlas_frame(&s->fa);
 
     if (s->tile_entries)
         blt_tile_list_static(s->e, s->tile_tex, BLT_BLEND_COPY, 0, 255, 0,
                              s->tile_entries_off, s->tile_entries, 0, 0, 0);
 
     emit_header(s, 30 + frame * 2);
+
+    if (frame >= BROWSE_FRAMES + MODAL_FRAMES) {
+        emit_detail(s, frame - (BROWSE_FRAMES + MODAL_FRAMES));
+        /* new glyphs (and their colours) must reach the fabric before the
+         * blits that read them */
+        uio_glyph_atlas_flush(u, &s->fa);
+        if (uio_clut_dirty(u)) uio_clut_upload(u);
+        uio_end_frame(u);
+        return;
+    }
 
     const int top = zui_header_bottom(&SZ);
     const int cell_w = BLT_FB_WIDTH / s->columns;
@@ -358,10 +449,16 @@ int main(void)
     blt_cmd_t *cmds = (blt_cmd_t *)calloc(RING_BYTES / BLT_CMD_BYTES, sizeof *cmds);
     if (!ring || !src || !fb || !cmds) { fprintf(stderr, "out of memory\n"); return 1; }
 
+    uint8_t *clut = (uint8_t *)calloc((size_t)BLT_CLUT_BANKS * BLT_CLUT_ENTRIES, 4);
+    if (!clut) { fprintf(stderr, "out of memory\n"); return 1; }
+
     blt_emitter_t e;
     uio_t u;
     blt_emitter_init(&e, ring, RING_BYTES, src, SRC_BYTES);
-    if (uio_init(&u, &e, src, VTX_BYTES) != 0) { fprintf(stderr, "uio_init failed\n"); return 1; }
+    if (uio_init(&u, &e, src, VTX_BYTES, SP_BYTES) != 0) { fprintf(stderr, "uio_init failed\n"); return 1; }
+    if (uio_clut_bind(&u, clut, (size_t)BLT_CLUT_BANKS * BLT_CLUT_ENTRIES * 4u) != 0) {
+        fprintf(stderr, "clut bind failed\n"); return 1;
+    }
     if (uio_load_font(&u) != 0) { fprintf(stderr, "font upload failed\n"); return 1; }
 
     scene_t s;
@@ -393,13 +490,28 @@ int main(void)
         free(px);
         if (!s.cover[i].surf.valid) { fprintf(stderr, "cover upload failed\n"); return 1; }
     }
-    printf("  uploaded        : %u B of sources (covers + background tile + glyph atlas)\n",
-           blt_alloc_used(&e.alloc));
+    /* the general-text engine: a PAL8 coverage atlas + its cache directory,
+     * plus the sprite channel a batched text run flushes through */
+    static uio_glyph_t glyph_slots[GLYPH_SLOTS];
+    uio_stroke_font_default(&s.font);
+    if (uio_glyph_atlas_init(&u, &s.fa, ATLAS_W, ATLAS_H, glyph_slots, GLYPH_SLOTS,
+                             uio_stroke_rasterize, &s.font, TEXT_PHASES) != 0) {
+        fprintf(stderr, "glyph atlas init failed\n");
+        return 1;
+    }
+    blt_sprite_channel_init(&s.chan, &e, 2048);
+
+    uio_corner(&u, 6, 255);      /* pre-bake the radii the browse screen uses */
+    uio_corner(&u, 9, 255);
+    uio_corner(&u, 7, 255);
+
+    printf("  uploaded        : %u B of sources (covers + background tile + "
+           "6x8 atlas + %dx%d glyph atlas)\n", blt_alloc_used(&e.alloc), ATLAS_W, ATLAS_H);
 
     mkdir("out", 0777);
 
     /* ---- per frame: emit a display list, and touch no pixels ------------- */
-    printf("\nframe  cmds  fills  blits  tris  glyphs   fabric px   A9 px avoided"
+    printf("\nframe  cmds  fills  blits  tris  glyphs  rast   fabric px   A9 px avoided"
            "  (fill/AA/scale/text)\n");
     uint64_t total_a9 = 0;
     uint32_t peak_cmds = 0;
@@ -414,7 +526,7 @@ int main(void)
         /* execute the list exactly as the fabric walks it */
         for (int i = 0; i < e.cmd_count; i++)
             blt_unpack_cmd(ring + (size_t)i * BLT_CMD_BYTES, &cmds[i]);
-        blt_surface_heap_t heap = { .base = src, .size = SRC_BYTES };
+        blt_surface_heap_t heap = { .base = src, .size = SRC_BYTES, .clut = clut };
         memset(fb, 0, (size_t)BLT_FB_PIXELS * sizeof *fb);
         blt_execute(fb, &heap, cmds, e.cmd_count);
 
@@ -426,12 +538,16 @@ int main(void)
         uint64_t a9 = st->a9_fill_px + st->a9_aa_px + st->a9_resample_px + st->a9_glyph_px;
         total_a9 += a9;
         if (st->cmds > peak_cmds) peak_cmds = st->cmds;
-        printf("%5d %5u %6u %6u %5u %7u %11llu %15llu  (%llu/%llu/%llu/%llu)%s\n",
-               f, st->cmds, st->fills, st->blits, st->trilists, st->glyphs,
+        uint32_t rast = s.fa.misses - s.last_misses;   /* glyphs the A9 rasterized */
+        s.last_misses = s.fa.misses;
+        const char *tag = f >= BROWSE_FRAMES + MODAL_FRAMES ? "  <- detail pane, general text"
+                        : f >= BROWSE_FRAMES               ? "  <- modal scrim" : "";
+        printf("%5d %5u %6u %6u %5u %7u %5u %11llu %15llu  (%llu/%llu/%llu/%llu)%s\n",
+               f, st->cmds, st->fills, st->blits, st->trilists, st->glyphs, rast,
                (unsigned long long)st->fabric_px, (unsigned long long)a9,
                (unsigned long long)st->a9_fill_px, (unsigned long long)st->a9_aa_px,
                (unsigned long long)st->a9_resample_px, (unsigned long long)st->a9_glyph_px,
-               f >= BROWSE_FRAMES ? "  <- modal scrim" : "");
+               tag);
     }
 
     printf("\n%d frames written to out/frame_NN.ppm\n", FRAMES);
@@ -439,12 +555,17 @@ int main(void)
            peak_cmds, peak_cmds * BLT_CMD_BYTES);
     printf("Corner masks baked for the whole run: %d (%s)\n", u.ncorners,
            "one per distinct radius the animated scale walks through");
+    printf("Glyph cache: %u distinct glyphs rasterized (%u texels), %u hits, "
+           "%u evictions, %u refused\n",
+           s.fa.misses, s.fa.rasterized_px, s.fa.hits, s.fa.evictions, s.fa.refused);
+    printf("             %u colours as CLUT ramps; the whole detail pane's text is "
+           "%u SPRITELIST command(s)\n", (unsigned)u.nramps, u.stats.glyph_batches);
     printf("Pixels the fabric composited instead of the A9: %llu over %d frames.\n",
            (unsigned long long)total_a9, FRAMES);
     printf("\nNOTE: emit-side accounting against the golden model, NOT a hardware\n"
            "measurement. The feasibility study's first recommendation is still to\n"
            "measure the real A9 frame time before building any of this.\n");
 
-    free(ring); free(src); free(fb); free(cmds);
+    free(ring); free(src); free(fb); free(cmds); free(clut);
     return 0;
 }

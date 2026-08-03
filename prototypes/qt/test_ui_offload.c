@@ -17,6 +17,8 @@
  */
 #include "ui_offload.h"
 #include "zaparoo_ui.h"
+#include "glyph_cache.h"
+#include "font_stroke.h"
 #include "blt_wire.h"
 #include <assert.h>
 #include <stdio.h>
@@ -26,6 +28,7 @@
 #define RING_BYTES (256u * 1024u)
 #define SRC_BYTES  (4u * 1024u * 1024u)
 #define VTX_BYTES  (64u * 1024u)
+#define SP_BYTES   (256u * 1024u)
 
 static int failures = 0;
 #define CHECK(cond, ...) do { if (!(cond)) { \
@@ -39,6 +42,7 @@ typedef struct {
     uint8_t      *ring;
     uint8_t      *src;
     uint16_t     *fb;
+    uint8_t      *clut;      /* device CLUT mirror (PAL8 text ramps)          */
 } env_t;
 
 static void env_init(env_t *v)
@@ -46,12 +50,15 @@ static void env_init(env_t *v)
     v->ring = (uint8_t *)calloc(RING_BYTES, 1);
     v->src  = (uint8_t *)calloc(SRC_BYTES, 1);
     v->fb   = (uint16_t *)calloc(BLT_FB_PIXELS, sizeof(uint16_t));
-    assert(v->ring && v->src && v->fb);
+    v->clut = (uint8_t *)calloc((size_t)BLT_CLUT_BANKS * BLT_CLUT_ENTRIES, 4);
+    assert(v->ring && v->src && v->fb && v->clut);
     blt_emitter_init(&v->e, v->ring, RING_BYTES, v->src, SRC_BYTES);
-    assert(uio_init(&v->u, &v->e, v->src, VTX_BYTES) == 0);
+    assert(uio_init(&v->u, &v->e, v->src, VTX_BYTES, SP_BYTES) == 0);
+    assert(uio_clut_bind(&v->u, v->clut,
+                         (size_t)BLT_CLUT_BANKS * BLT_CLUT_ENTRIES * 4u) == 0);
 }
 
-static void env_free(env_t *v) { free(v->ring); free(v->src); free(v->fb); }
+static void env_free(env_t *v) { free(v->ring); free(v->src); free(v->fb); free(v->clut); }
 
 /* Execute the emitted ring into v->fb, exactly as the fabric walks it. */
 static void env_run(env_t *v)
@@ -60,7 +67,7 @@ static void env_run(env_t *v)
     blt_cmd_t *cmds = (blt_cmd_t *)calloc((size_t)n + 1, sizeof *cmds);
     assert(cmds);
     for (int i = 0; i < n; i++) blt_unpack_cmd(v->ring + (size_t)i * BLT_CMD_BYTES, &cmds[i]);
-    blt_surface_heap_t h = { .base = v->src, .size = SRC_BYTES };
+    blt_surface_heap_t h = { .base = v->src, .size = SRC_BYTES, .clut = v->clut };
     blt_execute(v->fb, &h, cmds, n);
     free(cmds);
 }
@@ -633,7 +640,340 @@ static void test_frame_budget(void)
     env_free(&v);
 }
 
-/* ── 8. the ported Zaparoo layout rules ─────────────────────────────────── */
+/* ── 8. general text: any font, any size, antialiased ───────────────────── */
+/*
+ *  A coverage ramp is 16 CLUT entries sharing one RGB565 with alpha climbing
+ *  0..15. The top entry has to composite bit-identically to a FILL of that
+ *  colour — otherwise fully-covered glyph interiors sit a least-significant bit
+ *  away from every other shape in the theme — and the bottom entry has to be
+ *  skip-write, so a glyph's background texels cost no framebuffer traffic.
+ */
+static void test_text_ramp(void)
+{
+    env_t v; env_init(&v);
+    const uint16_t COL = blt_rgb565(226, 230, 240);
+
+    int word = uio_text_ramp(&v.u, COL);
+    CHECK(word >= 0, "ramp allocation failed");
+    CHECK(uio_text_ramp(&v.u, COL) == word, "same colour got two ramps");
+    CHECK(uio_clut_dirty(&v.u), "new ramp did not mark the CLUT dirty");
+
+    /* a 1x16 PAL8 strip: one texel per coverage level */
+    uint32_t off = blt_alloc(&v.e.alloc, 16);
+    for (int i = 0; i < 16; i++) v.src[off + i] = (uint8_t)i;
+    blt_surface_ref_t strip = { off, 16, 16, 1, BLT_FMT_PAL8, 1, 16, BLT_ALLOC_FAIL };
+
+    uio_begin_frame(&v.u, 0, 0, 0);
+    uio_clut_upload(&v.u);
+    blt_blit_pal8(&v.e, strip, 0, 0, 16, 1, 0, 0, BLT_BLEND_PALPHA, 0, 255, 0,
+                  blt_pal_id((uint16_t)word), blt_base_off((uint16_t)word));
+    uio_end_frame(&v.u);
+    CHECK(!uio_clut_dirty(&v.u), "CLUT still dirty after upload");
+
+    const uint16_t BG = blt_rgb565(0, 0, 0);
+    fb_clear(&v, BG);
+    env_run(&v);
+    CHECK(px(&v, 0, 0) == BG, "coverage 0 was not skip-write");
+    CHECK(px(&v, 15, 0) == COL, "full coverage %04x != the fill colour %04x",
+          px(&v, 15, 0), COL);
+    for (int i = 1; i < 16; i++)
+        CHECK(px(&v, i, 0) != BG, "coverage level %d vanished", i);
+
+    /* Ramps spill across CLUT banks: 16 per bank, so colour 17 lands in bank 1. */
+    for (int i = 0; i < 17; i++) (void)uio_text_ramp(&v.u, (uint16_t)(0x0800u + i));
+    int spilled = uio_text_ramp(&v.u, 0x0900u);
+    CHECK(spilled >= 0 && blt_pal_id((uint16_t)spilled) >= 1,
+          "ramp allocator did not spill into a second CLUT bank");
+    printf("  text ramp: full coverage == FILL, level 0 skip-writes, banks spill\n");
+    env_free(&v);
+}
+
+/*  A4 is the alpha width every per-pixel-alpha source in this contract carries,
+ *  so 16 coverage levels is the ceiling for antialiased text. Bound the error
+ *  that quantisation costs against ideal 8-bit coverage, in the units that
+ *  matter: RGB565 channel steps after the blend. */
+static void test_coverage_quantization(void)
+{
+    int worst_alpha = 0, worst_r5 = 0, worst_g6 = 0;
+    for (int c8 = 0; c8 <= 255; c8++) {
+        int i  = (c8 * (UIO_COV_LEVELS - 1) + 127) / 255;
+        int a8 = (i << 4) | i;
+        int da = a8 - c8; if (da < 0) da = -da;
+        if (da > worst_alpha) worst_alpha = da;
+
+        /* white text over black: the channel the eye actually sees */
+        uint16_t ideal = blt_blend565(0xFFFF, 0, (uint8_t)c8);
+        uint16_t got   = blt_blend565(0xFFFF, 0, (uint8_t)a8);
+        int dr = ((ideal >> 11) & 0x1F) - ((got >> 11) & 0x1F); if (dr < 0) dr = -dr;
+        int dg = ((ideal >> 5) & 0x3F) - ((got >> 5) & 0x3F);   if (dg < 0) dg = -dg;
+        if (dr > worst_r5) worst_r5 = dr;
+        if (dg > worst_g6) worst_g6 = dg;
+    }
+    CHECK(worst_alpha <= 9, "coverage quantisation costs %d/255 of alpha", worst_alpha);
+    CHECK(worst_r5 <= 1, "quantisation moves a 5-bit channel by %d steps", worst_r5);
+    CHECK(worst_g6 <= 2, "quantisation moves the 6-bit channel by %d steps", worst_g6);
+    printf("  coverage quantisation: <=%d/255 alpha, <=%d of 31 red steps\n",
+           worst_alpha, worst_r5);
+}
+
+/* The stand-in rasterizer must produce what a real one would: proportional
+ * advances, real partial coverage, and metrics that place the glyph. */
+static void test_stroke_font(void)
+{
+    uio_stroke_font_t f;
+    uio_stroke_font_default(&f);
+    uio_glyph_bmp_t bi, bw, bo;
+    CHECK(uio_stroke_rasterize(&f, 'I', 16, 0, &bi) == 0, "'I' failed");
+    CHECK(uio_stroke_rasterize(&f, 'W', 16, 0, &bw) == 0, "'W' failed");
+    CHECK(uio_stroke_rasterize(&f, 'o', 16, 0, &bo) == 0, "'o' failed");
+    CHECK(bi.advance < bw.advance, "font is not proportional (I=%d W=%d)",
+          bi.advance, bw.advance);
+    CHECK(bo.h < bi.h, "lowercase small caps not shorter (o=%d I=%d)", bo.h, bi.h);
+    CHECK(bi.bearing_y > 0 && bi.bearing_y <= 20, "'I' bearing_y %d", bi.bearing_y);
+
+    int partial = 0, ink = 0;
+    for (int y = 0; y < bw.h; y++)
+        for (int x = 0; x < bw.w; x++) {
+            int c = bw.cov[y * bw.pitch + x];
+            if (c) ink++;
+            if (c > 0 && c < 255) partial++;
+        }
+    CHECK(ink > 0, "'W' has no ink");
+    CHECK(partial > bw.h, "'W' has only %d antialiased texels — not AA", partial);
+
+    /* Scalable: doubling the cap height roughly doubles the advance. */
+    uio_glyph_bmp_t b32;
+    uio_stroke_rasterize(&f, 'W', 32, 0, &b32);
+    CHECK(b32.advance >= 2 * bw.advance - 3 && b32.advance <= 2 * bw.advance + 3,
+          "advance does not scale (16px=%d 32px=%d)", bw.advance, b32.advance);
+    CHECK(uio_stroke_rasterize(&f, 0x4E2D, 16, 0, &bi) != 0, "unmapped glyph accepted");
+    printf("  stroke font: proportional, antialiased, scalable (stand-in rasterizer)\n");
+}
+
+#define TEST_GLYPH_SLOTS 256
+
+static void test_glyph_cache(void)
+{
+    env_t v; env_init(&v);
+    static uio_glyph_t slots[TEST_GLYPH_SLOTS];
+    static uio_glyph_atlas_t fa;
+    static uio_stroke_font_t font;
+    uio_stroke_font_default(&font);
+    CHECK(uio_glyph_atlas_init(&v.u, &fa, 256, 128, slots, TEST_GLYPH_SLOTS,
+                               uio_stroke_rasterize, &font, 1) == 0, "atlas init failed");
+    CHECK(fa.surf.format == BLT_FMT_PAL8 && fa.surf.valid, "atlas is not a PAL8 source");
+
+    const char *msg = "Launch Game?";
+    const uint16_t COL = blt_rgb565(255, 179, 71);
+
+    uio_begin_frame(&v.u, 0, 0, 0);
+    uio_glyph_atlas_frame(&fa);
+    int w1 = uio_text_run(&v.u, &fa, 16, 20, 40, msg, COL);
+    uio_glyph_atlas_flush(&v.u, &fa);
+    uio_clut_upload(&v.u);
+    uio_end_frame(&v.u);
+    uint32_t misses1 = fa.misses;
+    CHECK(w1 > 0, "run measured zero width");
+    CHECK(misses1 > 0, "first frame rasterized nothing");
+    CHECK(fa.refused == 0, "atlas refused %u glyphs", fa.refused);
+    CHECK(v.u.stats.glyphs == 11, "expected 11 inked glyphs, got %u", v.u.stats.glyphs);
+
+    fb_clear(&v, 0);
+    env_run(&v);
+    int inked = 0, aa = 0;
+    for (int y = 0; y < BLT_FB_HEIGHT; y++)
+        for (int x = 0; x < BLT_FB_WIDTH; x++) {
+            uint16_t p = px(&v, x, y);
+            if (!p) continue;
+            inked++;
+            if (p != COL) aa++;                       /* partially covered edge */
+        }
+    CHECK(inked > 50, "text drew only %d pixels", inked);
+    CHECK(aa > 10, "no antialiased edge pixels (%d of %d)", aa, inked);
+
+    /* Second frame: the cache is warm, so the A9 rasterizes nothing at all. */
+    uint32_t px_before = fa.rasterized_px;
+    uio_begin_frame(&v.u, 0, 0, 0);
+    uio_glyph_atlas_frame(&fa);
+    int w2 = uio_text_run(&v.u, &fa, 16, 20, 40, msg, COL);
+    uio_end_frame(&v.u);
+    CHECK(w2 == w1, "advance changed between frames (%d -> %d)", w1, w2);
+    CHECK(fa.misses == misses1, "second frame rasterized %u new glyphs",
+          fa.misses - misses1);
+    CHECK(fa.rasterized_px == px_before, "second frame rasterized pixels");
+    CHECK(uio_glyph_atlas_flush(&v.u, &fa) == 0, "flush after a warm frame");
+
+    /* A different size is a different entry — this is the cost that does NOT
+     * amortise when text size animates. */
+    uio_begin_frame(&v.u, 0, 0, 0);
+    uio_glyph_atlas_frame(&fa);
+    uio_text_run(&v.u, &fa, 24, 20, 80, msg, COL);
+    uio_end_frame(&v.u);
+    CHECK(fa.misses > misses1, "a new pixel size reused the old raster");
+    printf("  glyph cache: %u distinct glyphs rasterized once, warm frames raster nothing\n",
+           fa.misses);
+    env_free(&v);
+}
+
+/*  Batching is the whole per-frame cost argument: because a sprite entry
+ *  carries its own palette word, an entire screen of text — mixed colours
+ *  included — is ONE command. It has to be pixel-identical to the per-glyph
+ *  path, or it is just a different renderer. */
+static void test_text_batching(void)
+{
+    env_t v; env_init(&v);
+    static uio_glyph_t slots[TEST_GLYPH_SLOTS];
+    static uio_glyph_atlas_t fa;
+    static uio_stroke_font_t font;
+    static blt_sprite_channel_t chan;
+    uio_stroke_font_default(&font);
+    uio_glyph_atlas_init(&v.u, &fa, 256, 128, slots, TEST_GLYPH_SLOTS,
+                         uio_stroke_rasterize, &font, 1);
+    blt_sprite_channel_init(&chan, &v.e, 1024);
+
+    const uint16_t A = blt_rgb565(255, 179, 71), B = blt_rgb565(226, 230, 240);
+    static const char *const LINES[4] = { "Scan a card", "Systems", "Settings 42", "Exit" };
+
+    /* pass 1: one blit per glyph */
+    uio_begin_frame(&v.u, 0, 0, 0);
+    uio_glyph_atlas_frame(&fa);
+    uio_clut_upload(&v.u);
+    for (int i = 0; i < 4; i++)
+        uio_text_run(&v.u, &fa, 14, 12, 30 + i * 24, LINES[i], (i & 1) ? A : B);
+    uio_glyph_atlas_flush(&v.u, &fa);
+    uio_end_frame(&v.u);
+    uint32_t unbatched_cmds = v.u.stats.cmds, glyphs = v.u.stats.glyphs;
+    fb_clear(&v, 0);
+    env_run(&v);
+    uint16_t *ref = (uint16_t *)malloc(BLT_FB_PIXELS * sizeof(uint16_t));
+    memcpy(ref, v.fb, BLT_FB_PIXELS * sizeof(uint16_t));
+
+    /* pass 2: the same text, batched into sprite lists */
+    uio_begin_frame(&v.u, 0, 0, 0);
+    uio_glyph_atlas_frame(&fa);
+    uio_clut_upload(&v.u);
+    uio_text_batch_begin(&v.u, &chan);
+    for (int i = 0; i < 4; i++)
+        uio_text_run(&v.u, &fa, 14, 12, 30 + i * 24, LINES[i], (i & 1) ? A : B);
+    int runs = uio_text_batch_flush(&v.u);
+    uio_end_frame(&v.u);
+    uint32_t batched_cmds = v.u.stats.cmds;
+
+    CHECK(v.u.stats.glyphs == glyphs, "batched pass drew %u glyphs, unbatched %u",
+          v.u.stats.glyphs, glyphs);
+    CHECK(runs == 1, "mixed-colour text took %d SPRITELIST commands, expected 1", runs);
+    CHECK(batched_cmds < unbatched_cmds, "batching did not reduce commands (%u vs %u)",
+          batched_cmds, unbatched_cmds);
+    CHECK(v.u.stats.glyph_batches == 1, "glyph_batches = %u", v.u.stats.glyph_batches);
+
+    fb_clear(&v, 0);
+    env_run(&v);
+    int diff = 0;
+    for (int i = 0; i < BLT_FB_PIXELS; i++) if (ref[i] != v.fb[i]) diff++;
+    CHECK(diff == 0, "batched output differs from per-glyph output in %d pixels", diff);
+
+    printf("  glyph batching: %u mixed-colour glyphs -> %u commands/frame "
+           "(%u unbatched), pixel-identical\n", glyphs, batched_cmds, unbatched_cmds);
+    free(ref);
+    env_free(&v);
+}
+
+/*  Two safety properties of a cache the fabric reads asynchronously: a glyph
+ *  used in the last two frames is never overwritten (the fabric may still be
+ *  reading the submitted frame), and a full atlas degrades by evicting rather
+ *  than by corrupting. */
+static void test_glyph_eviction(void)
+{
+    env_t v; env_init(&v);
+    static uio_glyph_t slots[16];
+    static uio_glyph_atlas_t fa;
+    static uio_stroke_font_t font;
+    uio_stroke_font_default(&font);
+    CHECK(uio_glyph_atlas_init(&v.u, &fa, 64, 32, slots, 16,
+                               uio_stroke_rasterize, &font, 1) == 0, "small atlas init");
+
+    /*  Phase A — a working set that does not fit, drawn in full every frame.
+     *  Every cached glyph was used THIS frame, so nothing is safe to evict and
+     *  the cache must refuse rather than overwrite texels the fabric may still
+     *  be reading. Refusing means glyphs go missing, which is why fa.refused
+     *  exists: an over-subscribed atlas is a reportable condition, not a
+     *  silent one. */
+    for (int frame = 0; frame < 4; frame++) {
+        uio_begin_frame(&v.u, 0, 0, 0);
+        uio_glyph_atlas_frame(&fa);
+        uio_text_run(&v.u, &fa, 12, 4, 20, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", 0xFFFF);
+        uio_end_frame(&v.u);
+        CHECK(v.e.overflow == 0, "frame %d overflowed", frame);
+    }
+    CHECK(fa.refused > 0, "a 64x32 atlas held 36 glyphs without pressure");
+    CHECK(fa.evictions == 0, "evicted a glyph that was drawn this frame");
+
+    /*  Phase B — a working set that CHANGES: each frame draws a different
+     *  short run, so glyphs age out and their rects are recycled. This is the
+     *  normal case (a menu scrolling through titles) and it must evict. */
+    /* code points phase A never cached, so each page needs a fresh rect */
+    static const char *const PAGES[6] = { "!!!", "???", "+++", "===", "<<<", ">>>" };
+    uint32_t refused_settled = 0;
+    for (int frame = 0; frame < 12; frame++) {
+        uio_begin_frame(&v.u, 0, 0, 0);
+        uio_glyph_atlas_frame(&fa);
+        uio_text_run(&v.u, &fa, 12, 4, 20, PAGES[frame % 6], 0xFFFF);
+        uio_end_frame(&v.u);
+        /* The in-flight guard costs the first couple of frames after a
+         * working-set change: the OLD glyphs were drawn in the frame the
+         * fabric may still be reading, so they cannot be recycled yet. Once
+         * they age out, the cache must stop refusing entirely. */
+        if (frame == 3) refused_settled = fa.refused;
+    }
+    CHECK(fa.evictions > 0, "a rotating working set never evicted");
+    CHECK(fa.refused == refused_settled,
+          "%u glyphs still refused after the old set aged out",
+          fa.refused - refused_settled);
+
+    /* Nothing drawn this frame or last may have been evicted under it. */
+    for (int i = 0; i < fa.count; i++) {
+        uio_glyph_t *g = &fa.slots[i];
+        if (!g->valid) continue;
+        CHECK(g->sx + g->w <= fa.w && g->sy + g->h <= fa.h,
+              "glyph U+%04X escapes the atlas", g->codepoint);
+    }
+    uint32_t in_flight = 0;
+    for (int i = 0; i < fa.count; i++)
+        if (fa.slots[i].valid && fa.frame - fa.slots[i].used_frame < 2) in_flight++;
+    CHECK(in_flight > 0, "no recent glyphs retained");
+    printf("  glyph eviction: %u evictions once glyphs age out, %u refusals while "
+           "the working set is pinned\n", fa.evictions, fa.refused);
+    env_free(&v);
+}
+
+/* Subpixel phases: with phases > 1 the same code point at different fractional
+ * pen positions is a different cache entry, which is what makes smoothly
+ * scrolling text (a marquee caption) land somewhere other than whole pixels. */
+static void test_subpixel_phases(void)
+{
+    env_t v; env_init(&v);
+    static uio_glyph_t slots[TEST_GLYPH_SLOTS];
+    static uio_glyph_atlas_t fa;
+    static uio_stroke_font_t font;
+    uio_stroke_font_default(&font);
+    uio_glyph_atlas_init(&v.u, &fa, 256, 128, slots, TEST_GLYPH_SLOTS,
+                         uio_stroke_rasterize, &font, 4);
+
+    uio_begin_frame(&v.u, 0, 0, 0);
+    uio_glyph_atlas_frame(&fa);
+    uio_text_run_fx(&v.u, &fa, 16, 20 << 8, 40, "W", 0xFFFF);
+    uio_text_run_fx(&v.u, &fa, 16, (20 << 8) + 128, 80, "W", 0xFFFF);   /* +0.5 px */
+    uio_end_frame(&v.u);
+    CHECK(fa.misses == 2, "two phases produced %u cache entries", fa.misses);
+
+    int phases_seen = 0;
+    for (int i = 0; i < fa.count; i++) if (fa.slots[i].valid) phases_seen |= 1 << fa.slots[i].phase;
+    CHECK(phases_seen == 0x05, "expected phases 0 and 2, got mask 0x%02x", phases_seen);
+    printf("  subpixel phases: fractional pen positions cache separately\n");
+    env_free(&v);
+}
+
+/* ── 9. the ported Zaparoo layout rules ─────────────────────────────────── */
 /*
  *  The demo's fidelity rests on zaparoo_ui.c reproducing the app's own sizing
  *  rules, so pin the values they produce on the CRT path at the model's
@@ -717,6 +1057,13 @@ int main(void)
     test_text();
     test_fit();
     test_frame_budget();
+    test_text_ramp();
+    test_coverage_quantization();
+    test_stroke_font();
+    test_glyph_cache();
+    test_text_batching();
+    test_glyph_eviction();
+    test_subpixel_phases();
     test_zaparoo_layout();
     if (failures) { printf("%d FAILURE(S)\n", failures); return 1; }
     printf("all gates pass\n");

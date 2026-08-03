@@ -12,8 +12,8 @@ CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Werror -I../../host -I../../refmodel
 
 DEPS = ../../host/blt_emitter.c ../../host/blt_alloc.c \
        ../../refmodel/blitter_ref.c ../../refmodel/blt_tri.c
-SRCS = ui_offload.c corner_atlas.c font6x8.c zaparoo_ui.c
-HDRS = ui_offload.h corner_atlas.h font6x8.h zaparoo_ui.h \
+SRCS = ui_offload.c corner_atlas.c font6x8.c zaparoo_ui.c glyph_cache.c font_stroke.c
+HDRS = ui_offload.h corner_atlas.h font6x8.h zaparoo_ui.h glyph_cache.h font_stroke.h \
        ../../host/blt_emitter.h ../../host/blt_wire.h ../../refmodel/blitter_ref.h
 
 test: test_ui_offload

@@ -90,6 +90,7 @@ typedef struct {
     uint32_t blits;
     uint32_t trilists;         /* TRILIST commands (one per scaled image)     */
     uint32_t glyphs;
+    uint32_t glyph_batches;    /* SPRITELIST commands carrying batched glyphs  */
     uint32_t rounded_rects;
     uint32_t uv_clamped;       /* scaled draws from an UNPADDED image         */
     uint64_t fabric_px;        /* destination pixels the fabric will touch    */
@@ -112,15 +113,32 @@ typedef struct {
     blt_surface_ref_t surf;    /* radius x radius ARGB4444 coverage mask      */
 } uio_corner_t;
 
+/* Text colours the CLUT ramp allocator will track (see glyph_cache.h). Each
+ * ramp is 16 of a bank's 256 slots, so the hardware ceiling is 512; this only
+ * bounds the lookup table. */
+#define UIO_MAX_TEXT_RAMPS 64
+
 typedef struct {
     blt_emitter_t *e;
     uint8_t  *src_base;        /* base of the source region blt_execute reads */
     uint32_t  vtx_off;         /* vertex arena, byte offset within src_base   */
     uint32_t  vtx_bytes;
+    uint32_t  sp_bytes;        /* sprite-entry arena (glyph batching)          */
     uio_corner_t corners[UIO_MAX_CORNERS];
     int       ncorners;
     blt_surface_ref_t font;
     int       font_ready;
+
+    /* [general text] device CLUT mirror + the coverage-ramp allocator, and the
+     * open glyph batch (see glyph_cache.h). NULL/0 until bound. */
+    uint8_t  *clut;
+    size_t    clut_bytes;
+    int       clut_dirty;
+    int       nramps;
+    uint16_t  ramp_color[UIO_MAX_TEXT_RAMPS];
+    uint16_t  ramp_word[UIO_MAX_TEXT_RAMPS];   /* blt_pal_color(pal_id, base) */
+    blt_sprite_channel_t *batch;               /* open glyph batch, or NULL   */
+
     uio_stats_t stats;         /* reset by uio_begin_frame                    */
     int       last_error;      /* first non-zero emitter/bake failure seen    */
 } uio_t;
@@ -134,9 +152,18 @@ typedef struct {
  *  The arena has to come out of the heap because a TRILIST header carries a
  *  byte offset resolved against the source-heap base; keeping the arena inside
  *  the heap is what makes those offsets valid for both blt_execute and the
- *  fabric. Returns 0, or -1 if the arena does not fit.
+ *  fabric.
+ *
+ *  `sprite_bytes` reserves the SPRITELIST entry arena used to batch glyphs
+ *  (glyph_cache.h); pass 0 to skip it. It is allocated FIRST and must land at
+ *  offset 0, because the sprite channel computes entry offsets relative to the
+ *  arena base while the fabric resolves them against the heap base — the two
+ *  only agree when the arena starts the heap. uio_init enforces that.
+ *
+ *  Returns 0, or -1 if an arena does not fit.
  */
-int uio_init(uio_t *u, blt_emitter_t *e, void *src_base, uint32_t vtx_bytes);
+int uio_init(uio_t *u, blt_emitter_t *e, void *src_base, uint32_t vtx_bytes,
+             uint32_t sprite_bytes);
 
 /* Bake + upload the 6x8 glyph atlas (once). Returns 0 or -1. */
 int uio_load_font(uio_t *u);

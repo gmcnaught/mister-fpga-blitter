@@ -44,7 +44,7 @@ currently bans**".
 | Workload shape | ⚠️ An event-driven menu composites on navigation and then idles. There may be **no sustained per-frame load to offload** — unlike Solarus's measured ~19 ms/frame at 60 fps. |
 | Expensive ops | ⚠️ AA corners, arbitrary-ratio scaling and glyphs are where the A9 time is, and none of them map without mitigation (§3). |
 | Resolution | ⚠️ A full-screen on-chip WORK image fits at ~320×240 RGB565 (~150 KB M10K). Higher modes need a **banded write-through cache** (§5.1). |
-| Text | ✅/⚠️ A fixed-cell **bitmap** font atlases trivially into uniform glyph blits. A scalable antialiased font does not. |
+| Text | ✅ A fixed-cell **bitmap** face atlases trivially; a proportional antialiased face works too, through a glyph cache the A9 fills once per (glyph, size) — coverage in alpha, colour from a CLUT ramp, a whole screen in one `SPRITELIST` (§4). |
 
 ## 1. What is already in place
 
@@ -141,30 +141,76 @@ The mitigations, each of which is a design constraint rather than a blocker:
   size instead" is not a free change: it trades the tier ladder's decode-cache
   stability for the 1:1 blit. Where that trade is not wanted, the triangle path
   is what is left.
-- **Text → glyph atlas**, if and only if the font is fixed-cell bitmap. Then
-  every glyph is a uniform blit out of one atlas, with no distance fields, no
-  sub-pixel positioning and no per-glyph raster. A scalable AA font does not
-  get this and stays on the A9.
-  *(Implemented: `prototypes/qt/font6x8.c`, `uio_text()`.)*
+- **Text → a glyph cache.** A fixed-cell bitmap face atlases directly; a
+  proportional antialiased face works too, through a coverage atlas the A9
+  fills once per (glyph, size) — see §4, which is where the interesting version
+  of this argument lives.
+  *(Implemented: `prototypes/qt/font6x8.c` + `glyph_cache.c`.)*
 - **Rotation → the output stage** (§5.2), off both the A9 and the compositor.
 
-## 4. The bitmap-font case
+## 4. Text — including the general case
 
-The usual worst case for a UI offload is text, and it splits cleanly in two.
+Text is usually named as the hard part of a UI offload. It is not, and it is
+worth being precise about why, because the easy version of the argument (a
+fixed-cell bitmap font atlases trivially) only covers the CRT path.
 
-A **fixed-cell bitmap font** — which a CRT path typically forces anyway,
-alongside `NoAntialias` and native text rendering — is the *ideal* glyph-atlas
-case: every glyph is a uniform cell, so the atlas is baked once into SDRAM as
-`PAL8` or ARGB4444 and each glyph is one blit (or a batched run through the
-sprite-list path). No distance fields, no antialiasing, no sub-pixel
-positioning. Text goes from the hard case to nearly free.
+**The fixed-cell case.** A CRT path typically forces a bitmap face with
+`NoAntialias` anyway. Every glyph is a uniform cell, so the atlas is baked once
+and each glyph is one blit. Nearly free, but it has one size, one advance
+width, no antialiasing, and no subpixel positions.
 
-Keep the atlas **colour-free** — white RGB, ink in the alpha channel — and
-supply the colour per run through `BLT_F_COLORMOD`, so one atlas serves every
-label colour in the theme.
+**The general case.** Proportional, antialiased, scalable text also composites
+on the fabric, and the reason is that **the fabric never has to rasterize text
+in order to draw it**. An outline is rasterized once, by the A9, at the size it
+is first seen; every frame after that is a blit of a cached coverage bitmap.
+For an offload only the steady state matters, and in the steady state text is
+pixels being *moved*, not pixels being *computed*.
 
-A **scalable antialiased font** gets none of this. Its glyph raster stays on
-the A9 and must be counted as fallback time (§5.4), not waved through.
+That makes "generalise text" three separate problems, and the contract already
+answers each:
+
+1. **Antialiasing → alpha.** Coverage lives in the source's alpha channel,
+   exactly like the baked corner masks, and `BLT_BLEND_PALPHA` composites it.
+   AA needs alpha in the atlas, not a rasterizer in the fabric.
+2. **Colour → the CLUT.** Make the atlas colour-free by letting a texel *be* a
+   coverage level: a `BLT_FMT_PAL8` glyph resolves through a 16-entry ramp
+   whose entries share one RGB565 with alpha climbing 0..15. One atlas serves
+   every colour, at 1 byte per texel, and a colour change is a palette
+   selection rather than a re-bake. (A ramp is 16 of a bank's 256 slots, so the
+   CLUT holds 512 text colours.)
+3. **Per-frame cost → the sprite list.** A `BLT_OP_SPRITELIST` entry carries
+   its *own* palette word, so an entire screen of text — mixed colours included
+   — is ONE command instead of one per glyph.
+
+Both `PAL8`+CLUT and `SPRITELIST` are production, hardware-validated paths, so
+none of this needs new fabric. Worked implementation:
+`prototypes/qt/glyph_cache.{h,c}`, gated against the reference model. In the
+demo's detail pane, 111 glyphs at three sizes in four colours cost **one
+SPRITELIST command and zero A9 raster** once the cache is warm.
+
+**What this does not fix**, and must be stated rather than glossed:
+
+- **Rasterization stays on the A9.** The cost is per distinct
+  (code point, size, subpixel phase), paid once. A menu's working set is a few
+  hundred glyphs; after that it is zero. But a **continuously animating text
+  size** never amortises — every size is a fresh raster, and the triangle path
+  cannot rescale a cached glyph because it samples no alpha channel. Scale the
+  box, not the type.
+- **16 coverage levels.** A4 is the alpha width every per-pixel-alpha source in
+  this contract carries, so 16 levels is the ceiling for AA anywhere, text
+  included. Measured against ideal 8-bit coverage that is ≤8/255 of alpha and
+  ≤1 step of a 5-bit channel after the blend — below an RGB565 LSB, i.e. not
+  the thing that will look wrong.
+- **Subpixel positioning costs cache entries.** N phases multiply the glyph
+  count by N. Pixel-aligned text (phases = 1) is free and is what a bitmap face
+  wants; smooth horizontal motion — a marquee caption — wants 3 or 4.
+- **The atlas is read asynchronously.** A glyph drawn in the last two frames
+  cannot be evicted, because the fabric may still be reading the frame the A9
+  just submitted. An over-subscribed atlas therefore *refuses* new glyphs
+  rather than corrupting a frame in flight — which means text can go missing,
+  which means the refusal count is a number an app has to watch (and size its
+  atlas by), not an internal detail.
+- **No sub-pixel RGB (LCD) filtering.** Grayscale coverage only.
 
 ## 5. Gates
 
