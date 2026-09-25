@@ -178,7 +178,13 @@ enum {
                                 * proposed — both are already taken (BLT_F_SRC_SDRAM,
                                 * BLT_F_COLORMOD); 0x80 is the only free bit in the u8
                                 * flags field. Flagged to the FPGA team for cross-check
-                                * before their side locks against it. */
+                                * before their side locks against it.
+                                * [present-from-surface] On BLT_OP_END the same bit means
+                                * "present the app surface this frame": the frame-end DMA
+                                * copies the BLT_TARGET_APPSURF surface out for scanout
+                                * instead of WORK, and WORK is left as it is. The host sets
+                                * it in place of an identity surface->WORK TRILIST copy.
+                                * See blt_present_buffer(). */
 
 /*
  *  Blit command — 32 bytes / 8x uint32. Layout is the on-wire DDR ring entry;
@@ -297,6 +303,13 @@ typedef struct {
  *  likewise never read outside the source region. Fully-offscreen rects are
  *  skipped with zero writes.
  */
+/*
+ *  [present-from-surface] The buffer the most recent blt_execute() presents:
+ *  the app surface if its END carried BLT_F_SRC_SURFACE, else `fb` (WORK).
+ *  This is what the display shows; WORK itself is not modified by the flag.
+ */
+const uint16_t *blt_present_buffer(const uint16_t *fb);
+
 int blt_execute(uint16_t *fb,
                 const blt_surface_heap_t *heap,
                 const blt_cmd_t *cmds,
