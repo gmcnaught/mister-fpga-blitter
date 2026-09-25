@@ -156,6 +156,9 @@ int  blt_fill_alpha(blt_emitter_t *e, int x, int y, int w, int h,
 /* Finish the frame: append END, latch cmd_count, bump submit_seq. After this
  * the caller publishes ring + control block to DDR and bumps the doorbell. */
 void blt_end_frame(blt_emitter_t *e);
+/* [present-from-surface] blt_end_frame with END.flags; BLT_F_SRC_SURFACE =
+ * present the app surface instead of WORK (see blitter_ref.h). */
+void blt_end_frame_flags(blt_emitter_t *e, uint8_t flags);
 
 /* [MiSTer #19] Emit a STAGE command that tells the fabric to copy a source
  * surface from DDR3 into SDRAM (fast-read backing) before subsequent BLITs.

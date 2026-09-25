@@ -227,6 +227,12 @@ static void blit_one(uint16_t *fb, const blt_surface_heap_t *heap, const blt_cmd
  * ────────────────────────────────────────────────────────────────────────── */
 static uint16_t appsurf[BLT_FB_PIXELS];
 
+/* [present-from-surface] set by the END of the last blt_execute(). */
+static int present_surf = 0;
+const uint16_t *blt_present_buffer(const uint16_t *fb) {
+    return present_surf ? appsurf : fb;
+}
+
 /* ──────────────────────────────────────────────────────────────────────────
  *  blt_execute — walk the command list against a 320x240 RGB565 framebuffer.
  * ────────────────────────────────────────────────────────────────────────── */
@@ -241,10 +247,14 @@ int blt_execute(uint16_t *fb,
      * route uniformly. Defaults to `fb` (BLT_TARGET_WORK) -- unchanged
      * behavior for every existing caller that never emits SET_TARGET. */
     uint16_t *dst = fb;
+    present_surf = 0;
     for (int ci = 0; ci < count; ci++) {
         const blt_cmd_t *c = &cmds[ci];
         executed++;
-        if (c->opcode == BLT_OP_END)  break;
+        if (c->opcode == BLT_OP_END) {
+            present_surf = (c->flags & BLT_F_SRC_SURFACE) != 0;
+            break;
+        }
         if (c->opcode == BLT_OP_NOP)  continue;
         if (c->opcode == BLT_OP_STAGE) continue; /* DDR->SDRAM stage: no FB effect */
         if (c->opcode == BLT_OP_SET_TARGET) {

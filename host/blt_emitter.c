@@ -188,8 +188,14 @@ int blt_fill_alpha(blt_emitter_t *e, int x, int y, int w, int h,
 
 void blt_end_frame(blt_emitter_t *e)
 {
+    blt_end_frame_flags(e, 0);
+}
+
+void blt_end_frame_flags(blt_emitter_t *e, uint8_t flags)
+{
     blt_cmd_t end; memset(&end, 0, sizeof(end));
     end.opcode = BLT_OP_END;
+    end.flags  = flags;       /* [present-from-surface] BLT_F_SRC_SURFACE */
     emit(e, &end);            /* END counts in cmd_count (walk-until-END) */
     e->submit_seq++;          /* doorbell: caller publishes then bumps DDR */
 }
