@@ -123,7 +123,11 @@ enum {
     BLT_BLEND_PALPHA      = 3, /* per-pixel source-over: src is ARGB4444,
                                 * dst = src*a + dst*(1-a), a = src.A4 (per px).
                                 * Source MUST be BLT_FMT_ARGB4444; A4==0 pixels
-                                * are skip-write (leave dst). (v2)             */
+                                * are skip-write (leave dst). (v2)             *
+                                * [TRILIST PALPHA] also valid on BLT_OP_TRILIST:*
+                                * pa = round(A8 * ea / 255), ea = (vtx a *    *
+                                * cmd.alpha)/255; dst = blend565(tint(src),dst,*
+                                * pa); A8==0 skips. See blt_tri.c.             */
     /* [v2 escape-elim] color-mod (BLT_F_COLORMOD) is applied to the source
      * BEFORE these blends, so it composes with all of them. ADD/MULTIPLY also
      * apply to BLT_OP_FILL (src channel = cmd.color channel). */
@@ -136,7 +140,9 @@ enum {
 /* ---- Source pixel formats (cmd.format) ---------------------------------- */
 enum {
     BLT_FMT_RGB565   = 0, /* 16bpp, no per-pixel alpha                        */
-    BLT_FMT_ARGB4444 = 1, /* 16bpp {A4,R4,G4,B4} (A in [15:12]); per-px alpha */
+    BLT_FMT_ARGB4444 = 1, /* 16bpp {A4,R4,G4,B4} (A in [15:12]); per-px alpha. *
+                           * TRILIST decodes it to RGB565 in EVERY blend mode;  *
+                           * COLORKEY compares the raw 16-bit texel.            */
     /* BLT_FMT_ARGB8888 = 2  -> future                                        */
 };
 
@@ -350,6 +356,20 @@ uint16_t blt_add565(uint16_t src565, uint16_t dst565);
 /* multiply: out_ch = round(src_ch * dst_ch / chan_max). C owns the exact
  * divide-free reduction; RTL must match it bit-for-bit. */
 uint16_t blt_mul565(uint16_t src565, uint16_t dst565);
+
+/* [TRILIST PALPHA] round(t/255) by the canonical divide-free reduction (the same
+ * /255 as blt_blend565 and the RTL red255). Exact for t in [0, 65025]. */
+static inline unsigned blt_div255_round(unsigned t) {
+    unsigned m = t + 128u; return (m + (m >> 8)) >> 8;
+}
+/* [TRILIST PALPHA] ARGB4444 {A4,R4,G4,B4} -> RGB565 by the SAME channel expansion
+ * as blt_blend4444 (R4->5b {r4,r4[3]}, G4->6b {g4,g4[3:2]}, B4->5b {b4,b4[3]}),
+ * and A4 -> A8 = {a4,a4} into *a8. */
+static inline uint16_t blt_argb4444_to_565(uint16_t s16, unsigned *a8) {
+    unsigned a4=(s16>>12)&0xF, r4=(s16>>8)&0xF, g4=(s16>>4)&0xF, b4=s16&0xF;
+    *a8 = (a4<<4)|a4;
+    return (uint16_t)((((r4<<1)|(r4>>3))<<11) | (((g4<<2)|(g4>>2))<<5) | ((b4<<1)|(b4>>3)));
+}
 
 /* Per-pixel source-over: src16 is ARGB4444 {A4,R4,G4,B4}, dst16 is RGB565.
  * Expand A4->A8 (a8={a4,a4}) and src R4/G4/B4 to the dest channel widths
