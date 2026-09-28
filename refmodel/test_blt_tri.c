@@ -170,7 +170,101 @@ static void test_rotated_quad(void){
     printf("test_rotated_quad OK\n");
 }
 
+/* ── [TRILIST PALPHA] per-texel alpha ─────────────────────────────────────── */
+/* 1x1 ARGB4444 texture page at heap offset 0. */
+static blt_cmd_t mk_hdr4444(uint8_t blend){
+    blt_cmd_t c = mk_hdr(blend); c.format = BLT_FMT_ARGB4444; return c;
+}
+static void fill(uint16_t *fb, uint16_t v){ for(int i=0;i<BLT_FB_PIXELS;i++) fb[i]=v; }
+static uint16_t palpha_px(uint16_t tex16, uint8_t vr, uint8_t vg, uint8_t vb, uint8_t va,
+                          uint8_t galpha, uint16_t bg){
+    uint8_t mem[2] = { (uint8_t)(tex16 & 0xFF), (uint8_t)(tex16 >> 8) };
+    blt_surface_heap_t heap; memset(&heap,0,sizeof heap); heap.base=mem; heap.size=2;
+    static uint16_t fb[BLT_FB_PIXELS]; fill(fb, bg);
+    blt_cmd_t h = mk_hdr4444(BLT_BLEND_PALPHA); h.alpha = galpha;
+    blt_vtx_t tris[6] = {
+        V(0,0,vr,vg,vb,va),  V(20,0,vr,vg,vb,va),  V(20,20,vr,vg,vb,va),
+        V(0,0,vr,vg,vb,va),  V(20,20,vr,vg,vb,va), V(0,20,vr,vg,vb,va),
+    };
+    blt_raster_tri(fb, &heap, &h, tris, 2, NULL);
+    return fb[10*BLT_FB_WIDTH+10];
+}
+/* Independent oracle: straight source-over in real arithmetic, rounded, with the
+ * documented expansions. Written from the spec, not from blt_tri.c. */
+static uint16_t palpha_oracle(uint16_t tex16, uint8_t vr, uint8_t vg, uint8_t vb, uint8_t va,
+                              uint8_t galpha, uint16_t bg){
+    unsigned a4=tex16>>12, r4=(tex16>>8)&15, g4=(tex16>>4)&15, b4=tex16&15;
+    if(a4==0) return bg;
+    unsigned a8=a4*17;
+    unsigned r5=(r4<<1)|(r4>>3), g6=(g4<<2)|(g4>>2), b5=(b4<<1)|(b4>>3);
+    /* tint: round(ch*mod/255) */
+    unsigned tr=(r5*vr*2+255)/510, tg=(g6*vg*2+255)/510, tb=(b5*vb*2+255)/510;
+    unsigned ea=(va*galpha)/255;                          /* truncating, as today */
+    unsigned pa=(a8*ea*2+255)/510;                        /* round(a8*ea/255) */
+    unsigned dr=bg>>11, dg=(bg>>5)&63, db=bg&31;
+    unsigned orr=((tr*pa+dr*(255-pa))*2+255)/510;
+    unsigned og=((tg*pa+dg*(255-pa))*2+255)/510;
+    unsigned ob=((tb*pa+db*(255-pa))*2+255)/510;
+    return (uint16_t)((orr<<11)|(og<<5)|ob);
+}
+static void test_palpha_sweep(void){
+    static const uint8_t A4[] = {0,1,7,8,14,15};
+    static const uint8_t VA[] = {0,1,64,128,254,255};
+    static const uint8_t GA[] = {255,128,1};
+    static const uint16_t RGB[] = {0x0FFF, 0x0F00, 0x00F0, 0x000F, 0x0000, 0x0A5C};
+    static const uint16_t BG[] = {0x001F, 0xFFFF, 0x0000, 0x7BEF};
+    int n=0;
+    for(unsigned ai=0;ai<sizeof A4;ai++) for(unsigned vi=0;vi<sizeof VA;vi++)
+    for(unsigned gi=0;gi<sizeof GA;gi++) for(unsigned ci=0;ci<sizeof RGB/2;ci++)
+    for(unsigned bi=0;bi<sizeof BG/2;bi++) {
+        uint16_t tex=(uint16_t)((A4[ai]<<12)|RGB[ci]);
+        uint16_t got=palpha_px(tex,255,255,255,VA[vi],GA[gi],BG[bi]);
+        uint16_t exp=palpha_oracle(tex,255,255,255,VA[vi],GA[gi],BG[bi]);
+        if(got!=exp){ fprintf(stderr,"palpha tex=%04x va=%u ga=%u bg=%04x got=%04x exp=%04x\n",
+                              tex,VA[vi],GA[gi],BG[bi],got,exp); assert(0); }
+        n++;
+    }
+    /* tint composes: a red vertex colour on a white texel at half alpha */
+    uint16_t got=palpha_px(0x8FFF,255,0,0,255,255,0x001F);
+    assert(got==palpha_oracle(0x8FFF,255,0,0,255,255,0x001F));
+    /* A4==0 is a skip even at full vertex alpha */
+    assert(palpha_px(0x0FFF,255,255,255,255,255,0x1234)==0x1234);
+    /* A4==15 at full vertex+header alpha is an opaque write of the expanded colour */
+    assert(palpha_px(0xFF00,255,255,255,255,255,0x001F)==0xF800);
+    printf("test_palpha_sweep OK (%d cases)\n", n);
+}
+/* ARGB4444 decode applies to the non-PALPHA modes too; COLORKEY compares RAW. */
+static void test_argb4444_other_modes(void){
+    uint8_t mem[2] = { 0x00, 0x8F };                    /* 0x8F00: A4=8, pure red */
+    blt_surface_heap_t heap; memset(&heap,0,sizeof heap); heap.base=mem; heap.size=2;
+    static uint16_t fb[BLT_FB_PIXELS];
+    blt_vtx_t tris[6] = {
+        V(0,0,255,255,255,255),  V(20,0,255,255,255,255),  V(20,20,255,255,255,255),
+        V(0,0,255,255,255,255),  V(20,20,255,255,255,255), V(0,20,255,255,255,255),
+    };
+    blt_cmd_t h = mk_hdr4444(BLT_BLEND_COPY);
+    fill(fb,0x001F); blt_raster_tri(fb,&heap,&h,tris,2,NULL);
+    assert(fb[10*BLT_FB_WIDTH+10]==0xF800);             /* alpha ignored, colour decoded */
+    h = mk_hdr4444(BLT_BLEND_COLORKEY); h.colorkey=0x8F00;
+    fill(fb,0x001F); blt_raster_tri(fb,&heap,&h,tris,2,NULL);
+    assert(fb[10*BLT_FB_WIDTH+10]==0x001F);             /* raw texel == key: culled */
+    h.colorkey=0xF800;
+    fill(fb,0x001F); blt_raster_tri(fb,&heap,&h,tris,2,NULL);
+    assert(fb[10*BLT_FB_WIDTH+10]==0xF800);             /* decoded value is NOT the key */
+    /* RGB565 page under PALPHA is fully opaque (a8=255): same as CONST_ALPHA */
+    uint8_t m565[2]={0x00,0xF8}; heap.base=m565;
+    h = mk_hdr(BLT_BLEND_PALPHA);
+    blt_vtx_t t2[6] = {
+        V(0,0,255,255,255,128),  V(20,0,255,255,255,128),  V(20,20,255,255,255,128),
+        V(0,0,255,255,255,128),  V(20,20,255,255,255,128), V(0,20,255,255,255,128),
+    };
+    fill(fb,0x001F); blt_raster_tri(fb,&heap,&h,t2,2,NULL);
+    assert(fb[10*BLT_FB_WIDTH+10]==blt_blend565(0xF800,0x001F,128));
+    printf("test_argb4444_other_modes OK\n");
+}
+
 int main(void){ test_solid_red_quad_copy(); test_alpha_blend_half();
     test_trilist_via_execute();
     test_overlap_order(); test_additive(); test_offscreen_clip(); test_rotated_quad();
+    test_palpha_sweep(); test_argb4444_other_modes();
     printf("ALL blt_tri tests OK\n"); return 0; }

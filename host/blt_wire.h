@@ -95,8 +95,9 @@ static inline void blt_unpack_cmd(const uint8_t in[BLT_CMD_BYTES], blt_cmd_t *c)
  *  triples); the header only points at it and carries the shared draw params:
  *
  *    opcode      = BLT_OP_TRILIST (10)
- *    blend_mode  = BLT_BLEND_*  (COPY / CONST_ALPHA / ADD / MULTIPLY / COLORKEY)
- *    format      = BLT_FMT_*    (texture page format)
+ *    blend_mode  = BLT_BLEND_*  (COPY / CONST_ALPHA / ADD / MULTIPLY / COLORKEY / PALPHA)
+ *    format      = BLT_FMT_*    (texture page format: RGB565, or ARGB4444 for
+ *                               per-texel alpha -- decoded in every blend mode)
  *    src_off     = texture page base byte offset in the source heap
  *    src_stride  = texture row stride in bytes
  *    src_x       = texture width  in texels

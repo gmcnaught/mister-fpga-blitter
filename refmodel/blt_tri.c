@@ -103,12 +103,25 @@ void blt_raster_tri(uint16_t *fb, const blt_surface_heap_t *heap,
                 int ca=(int)divr(w0*((a->rgba>>24)&0xff)+w1*((b->rgba>>24)&0xff)+w2*((c->rgba>>24)&0xff),area);
                 uint16_t texel=from_surface ? tex_nearest_surface(surface,u,v)
                                             : tex_nearest(heap,h,u,v);
-                uint16_t src=blt_tint565(texel,(uint8_t)cr,(uint8_t)cg,(uint8_t)cb);
+                /* [TRILIST PALPHA] An ARGB4444 page is decoded to RGB565 for EVERY
+                 * blend mode (one staged page can serve any blend); a8 is its
+                 * per-texel alpha. RGB565 pages (and the app surface) are opaque.
+                 * COLORKEY still compares the RAW fetched texel. */
+                unsigned a8=255;
+                uint16_t rgb=texel;
+                if(!from_surface && h->format==BLT_FMT_ARGB4444)
+                    rgb=blt_argb4444_to_565(texel,&a8);
+                uint16_t src=blt_tint565(rgb,(uint8_t)cr,(uint8_t)cg,(uint8_t)cb);
                 uint16_t *dp=&fb[py*BLT_FB_WIDTH+px];
                 int ea=(ca*h->alpha)/255;
                 switch(h->blend_mode){
                   case BLT_BLEND_COPY:        *dp=src; break;
                   case BLT_BLEND_CONST_ALPHA: *dp=blt_blend565(src,*dp,(uint8_t)ea); break;
+                  /* [TRILIST PALPHA] straight source-over at texel alpha x vertex
+                   * alpha x header alpha: pa = round(a8*ea/255). A8==0 is a skip. */
+                  case BLT_BLEND_PALPHA:
+                    if(a8!=0) *dp=blt_blend565(src,*dp,(uint8_t)blt_div255_round(a8*(unsigned)ea));
+                    break;
                   case BLT_BLEND_ADD:         *dp=blt_add565(src,*dp); break;
                   case BLT_BLEND_MULTIPLY:    *dp=blt_mul565(src,*dp); break;
                   case BLT_BLEND_COLORKEY:    if(texel!=h->colorkey)*dp=src; break;
